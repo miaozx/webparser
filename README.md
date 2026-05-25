@@ -224,6 +224,107 @@ echo '<html><body><h1>Test</h1><p>Hello world</p></body></html>' | cargo run --b
 cat page.html | cargo run --bin extract_stdin -- --url https://example.com --page-type product
 ```
 
+## HTTP Server
+
+The included `http_server` binary provides a high-performance, multi-threaded HTTP API for content extraction.
+
+### Build & Run
+
+```bash
+# Build release binary
+cargo build --bin http_server --release
+
+# Run with default port 3021
+./target/release/http_server
+
+# Custom host/port via environment variables
+WEBPARSER_HOST=127.0.0.1 WEBPARSER_PORT=8080 ./target/release/http_server
+```
+
+### Endpoints
+
+#### `GET /health`
+
+Health check. Returns `200 OK` with body `OK`.
+
+#### `POST /parse`
+
+Extract main content from HTML. Accepts JSON body:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `url` | `string` | No | Original URL (context for hostname extraction) |
+| `content` | `string` | **Yes** | Raw HTML content |
+| `encoding` | `string` | No | Character encoding hint (e.g. `"utf-8"`) |
+| `crawl_timestamp` | `int64` | No | Timestamp of crawl |
+| `query` | `string` | No | Search query context |
+| `source` | `string` | No | Source identifier |
+| `img_in_content` | `bool` | No | Extract images from content (default: `false`) |
+| `output_format` | `string` | No | `"text"`, `"markdown"`, or `"html"` (default: `"text"`) |
+
+Returns JSON:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ret_code` | `int` | Return code (0 = success, see below) |
+| `content` | `string` | Extracted text / markdown / html |
+| `url` | `string` | Original URL from request |
+| `title` | `string` | Extracted page title |
+| `head_title` | `string` | Raw `<title>` content |
+| `publish_time` | `string` | Publication date (RFC 3339), empty if not found |
+| `image_list` | `string[]` | URLs of extracted images |
+| `video_list` | `string[]` | URLs of extracted videos |
+| `position_list` | `int[]` | Content block positions |
+| `time_cost` | `int64` | Processing time in milliseconds |
+| `should_cache` | `bool` | Whether result is worth caching |
+| `hostname` | `string` | Hostname extracted from URL |
+| `hostlogo` | `string` | Main image / logo URL |
+
+### Return Codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| `0` | SUCCESS | Extraction successful |
+| `1` | BUILD_TREE_FAILED | HTML parsing failed |
+| `2` | PARSE_FAILED | Extraction failed |
+| `3` | EMPTY_CONTENT | No content provided in request |
+
+### Output Formats
+
+- `"text"` or `"1"` — Plain text output (default)
+- `"markdown"` or `"0"` — GitHub Flavored Markdown (headings, lists, tables, code blocks)
+- `"html"` or `"2"` — Preserved HTML structure
+
+### Examples
+
+```bash
+# Basic text extraction
+curl -X POST http://localhost:3021/parse \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/article",
+    "content": "<html><head><title>My Article</title></head><body><article><p>Hello world</p></article></body></html>",
+    "output_format": "text"
+  }'
+
+# Markdown output with images
+curl -X POST http://localhost:3021/parse \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/article",
+    "content": "<html>...",
+    "img_in_content": true,
+    "output_format": "markdown"
+  }'
+
+# Health check
+curl http://localhost:3021/health
+```
+
+### Performance
+
+The server uses Tokio's multi-threaded runtime and processes each request concurrently. Based on the extraction benchmark, a single instance handles 20+ QPS comfortably on a 2-core machine.
+
 ## Extracted Data
 
 The `ExtractResult` struct contains:
