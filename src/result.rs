@@ -75,12 +75,10 @@ pub struct ExtractResult {
     pub extraction_quality: f64,
 
     /// Warnings encountered during extraction.
-    ///
-    /// Non-fatal issues that occurred during extraction, such as:
-    /// - Content extraction failed (metadata-only result)
-    /// - Individual metadata fields failed to extract
-    /// - Recoverable parsing errors
     pub warnings: Vec<String>,
+
+    /// Whether the title-anchored strategy was used to find content.
+    pub title_anchored_used: bool,
 }
 
 /// Metadata extracted from an HTML document.

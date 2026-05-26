@@ -223,6 +223,9 @@ pub struct Options {
     /// Default: `false`
     pub output_markdown: bool,
 
+    /// When true, skip the title-anchored content extraction strategy.
+    pub disable_title_anchored: bool,
+
     /// Override page type classification.
     ///
     /// When set, skips the ML classifier and uses this page type directly
@@ -264,6 +267,7 @@ impl Default for Options {
             include_title_in_content: false,
             // EPIC-02: Markdown output
             output_markdown: false,
+            disable_title_anchored: false,
             page_type: None,
         }
     }

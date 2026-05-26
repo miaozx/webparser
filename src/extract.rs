@@ -26,6 +26,7 @@ use std::cell::Cell;
 // Set during forum extraction where comments ARE the content.
 thread_local! {
     static COMMENTS_ARE_CONTENT: Cell<bool> = const { Cell::new(false) };
+    static TA_USED: Cell<bool> = const { Cell::new(false) };
 }
 use crate::selector;
 use crate::result::{ExtractResult, ImageData};
@@ -418,24 +419,60 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
         classification_confidence,
         extraction_quality,
         warnings,
+        title_anchored_used: TA_USED.with(|c| c.get()),
     };
 
     // EPIC-02: Generate Markdown output if enabled
     // Uses quick_html2md for HTML→Markdown conversion with GFM support
     if options.output_markdown {
         if let Some(ref html) = result.content_html {
+            use crate::markdown::{extract_and_clean_tables, restore_tables_in_markdown, wrap_orphan_lists};
             use quick_html2md::{html_to_markdown_with_options, MarkdownOptions};
+
+            // Wrap orphan <li> elements (not inside <ul>/<ol>) in <ul> tags
+            // so quick_html2md can convert them to markdown lists
+            let fixed_html = wrap_orphan_lists(html);
+
+            // Extract tables from HTML, clean them (strip style, remove tabs/newlines),
+            // and replace with placeholders for later restoration as raw HTML in markdown
+            let (processed_html, table_list) = extract_and_clean_tables(&fixed_html);
 
             // Map rs-trafilatura Options to quick_html2md MarkdownOptions
             // quick_html2md v0.2 handles position-aware escaping natively
+            // Tables are disabled here since they are handled as raw HTML
             let md_options = MarkdownOptions::new()
-                .include_links(options.include_links)
+                .include_links(false)
                 .include_images(options.include_images)
-                .preserve_tables(options.include_tables)
+                .preserve_tables(false)
                 .escape_special_chars(true);
 
-            // Convert HTML to Markdown (quick_html2md handles tables and escaping natively)
-            let markdown = html_to_markdown_with_options(html, &md_options);
+            // Convert HTML to Markdown (tables were replaced with placeholders)
+            let mut markdown = html_to_markdown_with_options(&processed_html, &md_options);
+
+            // Restore tables as raw HTML in markdown output
+            if !table_list.is_empty() {
+                markdown = restore_tables_in_markdown(&markdown, &table_list);
+            }
+
+            // Remove all tab characters from final markdown output
+            markdown = markdown.replace('\t', "");
+
+            // Strip leading whitespace from text (non-code) lines
+            // Preserve indentation inside fenced code blocks
+            let mut in_code_block = false;
+            let mut cleaned_lines = Vec::with_capacity(markdown.lines().count());
+            for line in markdown.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    in_code_block = !in_code_block;
+                    cleaned_lines.push(trimmed);
+                } else if in_code_block {
+                    cleaned_lines.push(line);
+                } else {
+                    cleaned_lines.push(trimmed);
+                }
+            }
+            markdown = cleaned_lines.join("\n");
 
             result.content_markdown = Some(markdown);
         }
@@ -2342,6 +2379,40 @@ fn extract_filtered_text_inner(
         return String::new();
     };
 
+    // Handle root-as-table: when the root element IS a table, process it directly
+    // (descendants() excludes self, so the normal is_table check inside the loop won't fire)
+    let root_tag = root_node.node_name();
+    eprintln!("!!! extract_filtered_text_inner: root_tag={:?} root_text_len={}", root_tag, root.text().len());
+    if root_tag.as_ref().is_some_and(|t| t.eq_ignore_ascii_case("table")) {
+        let table_sel = Selection::from(*root_node);
+        eprintln!("!!! ROOT IS TABLE: is_layout={} ld_test={} include_tables={}",
+            is_layout_table(&table_sel), link_density_test_tables(&table_sel, options), options.include_tables);
+        if options.include_tables && !is_layout_table(&table_sel)
+            && !link_density_test_tables(&table_sel, options)
+        {
+            eprintln!("!!! CALLING extract_table_text");
+            let table_text = extract_table_text(&table_sel);
+            if !table_text.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&table_text);
+                out.push_str("\n\n");
+            }
+        } else {
+            eprintln!("!!! TABLE FILTERED, falling to raw text extraction");
+            for node in root_node.descendants() {
+                if node.is_text() {
+                    let text = node.text();
+                    if !text.trim().is_empty() {
+                        out.push_str(&text);
+                    }
+                }
+            }
+        }
+        let result = normalize_text_output(&out);
+        eprintln!("!!! extract_filtered_text_inner returning {} chars", result.len());
+        return result;
+    }
+
     // EPIC-06: Pre-build excluded tag set for fast lookup
     let excluded_tags = excluded_tag_names();
 
@@ -2685,14 +2756,29 @@ fn extract_filtered_html_inner(
     let mut out = String::new();
     let tag = dom::tag_name(root).unwrap_or_default().to_ascii_lowercase();
     let inside_article_or_main = matches!(tag.as_str(), "article" | "main");
-    push_filtered_html_children(
-        root,
-        &mut out,
-        inside_article_or_main,
-        false,
-        options,
-        filter_named_boilerplate,
-    );
+
+    // Handle root-as-table: output <table> wrapper around children
+    if tag == "table" {
+        out.push_str("<table>");
+        push_filtered_html_children(
+            root,
+            &mut out,
+            inside_article_or_main,
+            false,
+            options,
+            filter_named_boilerplate,
+        );
+        out.push_str("</table>");
+    } else {
+        push_filtered_html_children(
+            root,
+            &mut out,
+            inside_article_or_main,
+            false,
+            options,
+            filter_named_boilerplate,
+        );
+    }
     out.trim().to_string()
 }
 
@@ -2736,14 +2822,19 @@ fn push_filtered_html_children(
             }
 
             if filter_named_boilerplate {
-                if let Some(class) = el.attr("class") {
-                    if is_boilerplate(&class) {
-                        continue;
+                // Skip boilerplate class/id check for <table> when include_tables=true,
+                // since data tables often contain class names like "related-col-*"
+                // that would falsely match boilerplate patterns.
+                if tag != "table" || !options.include_tables {
+                    if let Some(class) = el.attr("class") {
+                        if is_boilerplate(&class) {
+                            continue;
+                        }
                     }
-                }
-                if let Some(id) = el.attr("id") {
-                    if is_boilerplate(&id) {
-                        continue;
+                    if let Some(id) = el.attr("id") {
+                        if is_boilerplate(&id) {
+                            continue;
+                        }
                     }
                 }
             }

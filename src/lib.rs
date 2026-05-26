@@ -77,6 +77,7 @@ pub(crate) mod extractor;
 pub(crate) mod metadata;
 pub(crate) mod url_utils;
 pub(crate) mod link_density;
+pub mod title_anchored;
 
 // Public API - re-exports
 pub use error::{Error, Result};

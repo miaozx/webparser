@@ -601,6 +601,17 @@ fn has_nested_content_element(element: &Selection) -> bool {
     false
 }
 
+/// Measure total text length contained within <a> tags
+fn measure_link_text(element: &Selection) -> usize {
+    let mut total = 0usize;
+    for node in element.select("a").nodes() {
+        let sel = crate::dom::Selection::from(*node);
+        let t = sel.text();
+        total += t.trim().len();
+    }
+    total
+}
+
 /// Find content element using prioritized rules
 ///
 /// Returns the first element matching any rule, checked in priority order.
@@ -630,6 +641,15 @@ pub fn find_content<'a>(root: &Selection<'a>) -> Option<Selection<'a>> {
             // Skip elements inside header/nav/aside (O(1) lookup per ancestor)
             if boilerplate_cache.is_inside_boilerplate(&element) {
                 continue;
+            }
+
+            // Debug: log what we're checking
+            let el_tag = tag(&element);
+            let el_class = class(&element);
+            let el_id = id(&element);
+            if cfg!(debug_assertions) {
+                eprintln!("DEBUG find_content checking rule={:?} tag={} class={:?} id={:?}", 
+                    &rule as *const _ as usize, el_tag, el_class, el_id);
             }
 
             // Skip wrapper elements that contain more specific nested content elements.
@@ -663,6 +683,21 @@ pub fn find_content<'a>(root: &Selection<'a>) -> Option<Selection<'a>> {
             // Check if this element has enough content
             let text = dom::text_content(&element);
             let text_len = text.trim().len();
+
+            // Filter out navigation-like content: elements where most text is inside <a> tags
+            // Navigation menus have many links with little non-link text.
+            if text_len > 100 {
+                let link_text_len = measure_link_text(&element);
+                let nonlink_ratio = if text_len > 0 {
+                    (text_len - link_text_len) as f64 / text_len as f64
+                } else {
+                    1.0
+                };
+                // If < 20% of text is outside <a> tags, this is likely navigation
+                if nonlink_ratio < 0.2 && link_text_len > 0 {
+                    continue;
+                }
+            }
 
             // If the matched element has minimal content, it might be a metadata
             // container (e.g., itemprop="articleBody" with just meta tags).

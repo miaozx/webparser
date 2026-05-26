@@ -160,7 +160,10 @@ impl ExtractionProfile {
         comments_are_content: false,
         lenient_boilerplate: false,
         content_selectors: &[],
-        preserve_tags: &[],
+        // Many CMS platforms wrap article content in a <form> element for
+        // internal management purposes. Without preserving form, the article
+        // content gets silently removed during doc_cleaning.
+        preserve_tags: &["form"],
         min_paragraph_density: 0.4,
         boilerplate_selectors: &[],
         aggregate_sections: true,

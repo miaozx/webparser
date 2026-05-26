@@ -278,6 +278,293 @@ pub fn post_process_markdown(markdown: &str) -> String {
     result
 }
 
+/// Extract and clean tables from HTML for markdown output.
+///
+/// Tables are cleaned by removing style attributes and removing
+/// tabs and newlines within table tags, then replaced with
+/// placeholders for later restoration.
+///
+/// # Arguments
+///
+/// * `html` - The HTML content containing tables
+///
+/// # Returns
+///
+/// `(processed_html, table_list)` where `processed_html` has tables
+/// replaced with placeholders, and `table_list` contains the cleaned
+/// table HTML strings.
+#[must_use]
+pub fn extract_and_clean_tables(html: &str) -> (String, Vec<String>) {
+    use regex::Regex;
+
+    let mut tables: Vec<String> = Vec::new();
+    let mut result = String::new();
+    let mut remaining = html;
+    let mut idx = 0;
+
+    let style_re = Regex::new(r#"\s+style\s*=\s*"[^"]*""#).unwrap();
+    let style_re2 = Regex::new(r#"\s+style\s*=\s*'[^']*'"#).unwrap();
+    let link_re = Regex::new(r#"<a\b[^>]*>"#).unwrap();
+    let link_close_re = Regex::new(r#"</a>"#).unwrap();
+
+    while let Some(start) = remaining.find("<table") {
+        let tag_start = start;
+
+        // Find end of opening <table ...> tag
+        let after_tag = match remaining[tag_start..].find('>') {
+            Some(p) => tag_start + p + 1,
+            None => {
+                result.push_str(remaining);
+                break;
+            }
+        };
+
+        if after_tag >= remaining.len() {
+            result.push_str(remaining);
+            break;
+        }
+
+        // Find matching </table> with nesting support
+        // Use byte-level comparisons to avoid UTF-8 boundary panics
+        let mut depth = 1u32;
+        let mut search_pos = after_tag;
+        let bytes = remaining.as_bytes();
+        let table_end = loop {
+            if search_pos >= remaining.len() {
+                break remaining.len();
+            }
+
+            if bytes[search_pos..].starts_with(b"</table>") {
+                depth -= 1;
+                if depth == 0 {
+                    break search_pos + 8;
+                }
+                search_pos += 8;
+            } else if bytes[search_pos..].starts_with(b"<table") {
+                depth += 1;
+                search_pos += 6;
+            } else {
+                search_pos += 1;
+            }
+        };
+
+        // Push content before the table
+        result.push_str(&remaining[..tag_start]);
+
+        // Extract, clean, and store the table
+        let table_html = &remaining[tag_start..table_end];
+        let cleaned = style_re.replace_all(table_html, "");
+        let cleaned = style_re2.replace_all(&cleaned, "");
+        let cleaned = link_re.replace_all(&cleaned, "");
+        let cleaned = link_close_re.replace_all(&cleaned, "");
+        let cleaned = cleaned.replace('\t', "").replace('\n', "").replace('\r', "");
+
+        let placeholder = format!("TBLPLCHLDR{idx:04}");
+        idx += 1;
+        tables.push(cleaned.to_string());
+
+        // Insert placeholder wrapped in <p> tag to prevent quick_html2md from stripping it
+        result.push_str("<p>");
+        result.push_str(&placeholder);
+        result.push_str("</p>\n");
+
+        remaining = &remaining[table_end..];
+    }
+
+    result.push_str(remaining);
+
+    (result, tables)
+}
+
+/// Restore table placeholders in markdown with cleaned table HTML.
+///
+/// # Arguments
+///
+/// * `markdown` - Markdown content with table placeholders
+/// * `tables` - List of cleaned table HTML strings to restore
+#[must_use]
+pub fn restore_tables_in_markdown(markdown: &str, tables: &[String]) -> String {
+    let mut result = markdown.to_string();
+    for (i, table_html) in tables.iter().enumerate() {
+        let placeholder = format!("TBLPLCHLDR{i:04}");
+        result = result.replace(&placeholder, table_html);
+    }
+    result
+}
+
+/// Wrap orphan `<li>` elements (not inside `<ul>`/`<ol>`) in `<ul>` tags
+/// so quick_html2md can convert them to markdown lists.
+#[must_use]
+/// Append a character at byte position `i` in `html`, handling multi-byte UTF-8.
+/// Returns the number of bytes consumed (1 for ASCII, 2-4 for multi-byte).
+#[inline]
+fn push_char_at(result: &mut String, html: &str, i: usize) -> usize {
+    if html.as_bytes()[i] < 128 {
+        result.push(html.as_bytes()[i] as char);
+        1
+    } else {
+        let ch = html[i..].chars().next().unwrap();
+        result.push(ch);
+        ch.len_utf8()
+    }
+}
+
+pub fn wrap_orphan_lists(html: &str) -> String {
+    let mut result = String::new();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let mut ul_depth = 0;
+    let mut table_depth = 0;
+    let mut in_group = false;
+    let mut in_li = false;
+    let mut text_after_li = false;
+
+    while i < bytes.len() {
+        // Handle tag starts
+        if bytes[i] == b'<' {
+            // </ul> or </ol>
+            if i + 5 < bytes.len()
+                && bytes[i + 1] == b'/'
+                && ((bytes[i + 2] | 32) == b'u' || (bytes[i + 2] | 32) == b'o')
+                && (bytes[i + 3] | 32) == b'l'
+                && bytes[i + 4] == b'>'
+            {
+                close_group(&mut result, &mut in_group);
+                in_li = false;
+                text_after_li = false;
+                if ul_depth > 0 {
+                    ul_depth -= 1;
+                }
+                result.push_str(&html[i..i + 5]);
+                i += 5;
+                continue;
+            }
+            // <ul> or <ol> (opening)
+            if i + 3 < bytes.len()
+                && bytes[i + 1] != b'/'
+                && ((bytes[i + 1] | 32) == b'u' || (bytes[i + 1] | 32) == b'o')
+                && (bytes[i + 2] | 32) == b'l'
+                && !bytes[i + 3].is_ascii_alphabetic()
+            {
+                let end = find_gt(bytes, i + 1);
+                if end > 0 {
+                    close_group(&mut result, &mut in_group);
+                    in_li = false;
+                    text_after_li = false;
+                    ul_depth += 1;
+                    result.push_str(&html[i..=end]);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            // <li (opening) - case-insensitive
+            if i + 3 < bytes.len()
+                && bytes[i + 1] != b'/'
+                && (bytes[i + 1] | 32) == b'l'
+                && (bytes[i + 2] | 32) == b'i'
+                && !bytes[i + 3].is_ascii_alphabetic()
+            {
+                let end = find_gt(bytes, i + 1);
+                if end > 0 {
+                    if ul_depth == 0 && table_depth == 0 && !in_group {
+                        result.push_str("<ul>");
+                        in_group = true;
+                    }
+                    in_li = true;
+                    text_after_li = false;
+                    result.push_str(&html[i..=end]);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            // </li>
+            if i + 5 < bytes.len()
+                && bytes[i + 1] == b'/'
+                && (bytes[i + 2] | 32) == b'l'
+                && (bytes[i + 3] | 32) == b'i'
+                && bytes[i + 4] == b'>'
+            {
+                result.push_str("</li>");
+                i += 5;
+                in_li = false;
+                text_after_li = true;
+                continue;
+            }
+            // Any tag (open or close) at depth 0 outside <li> closes orphan group
+            if ul_depth == 0 && table_depth == 0 && in_group && !in_li {
+                close_group(&mut result, &mut in_group);
+            }
+            // </table>
+            if i + 8 < bytes.len()
+                && bytes[i + 1] == b'/'
+                && (bytes[i + 2] | 32) == b't'
+                && (bytes[i + 3] | 32) == b'a'
+                && (bytes[i + 4] | 32) == b'b'
+                && (bytes[i + 5] | 32) == b'l'
+                && (bytes[i + 6] | 32) == b'e'
+                && bytes[i + 7] == b'>'
+            {
+                if table_depth > 0 {
+                    table_depth -= 1;
+                }
+                result.push_str("</table>");
+                i += 8;
+                continue;
+            }
+            // <table (opening)
+            if i + 6 < bytes.len()
+                && bytes[i + 1] != b'/'
+                && (bytes[i + 1] | 32) == b't'
+                && (bytes[i + 2] | 32) == b'a'
+                && (bytes[i + 3] | 32) == b'b'
+                && (bytes[i + 4] | 32) == b'l'
+                && (bytes[i + 5] | 32) == b'e'
+                && !bytes[i + 6].is_ascii_alphabetic()
+            {
+                let end = find_gt(bytes, i + 1);
+                if end > 0 {
+                    table_depth += 1;
+                    result.push_str(&html[i..=end]);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            // Copy the tag character
+            text_after_li = false;
+            let adv = push_char_at(&mut result, html, i);
+            i += adv;
+            continue;
+        }
+        // Non-whitespace text when not inside <li> and not inside table/ul closes orphan group
+        if in_group && !in_li && table_depth == 0 && text_after_li && !bytes[i].is_ascii_whitespace() {
+            close_group(&mut result, &mut in_group);
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            text_after_li = false;
+        }
+        let adv = push_char_at(&mut result, html, i);
+        i += adv;
+    }
+
+    close_group(&mut result, &mut in_group);
+    result
+}
+
+fn close_group(result: &mut String, in_group: &mut bool) {
+    if *in_group {
+        result.push_str("</ul>");
+        *in_group = false;
+    }
+}
+
+fn find_gt(bytes: &[u8], start: usize) -> usize {
+    let mut j = start;
+    while j < bytes.len() && bytes[j] != b'>' {
+        j += 1;
+    }
+    if j < bytes.len() { j } else { 0 }
+}
+
 /// Convert an HTML table to GitHub Flavored Markdown format.
 ///
 /// # Arguments
@@ -623,6 +910,15 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_and_clean_tables_no_tables() {
+        let html = "<body>Are dress requirements in place of work important?</body>";
+        let (processed, tables) = extract_and_clean_tables(html);
+        eprintln!("processed: {processed:?}");
+        assert!(tables.is_empty(), "no tables should be extracted");
+        assert_eq!(processed, html, "no-table HTML should pass through unchanged");
+    }
+
+    #[test]
     fn test_empty_table() {
         let html = "<table></table>";
         let result = html_table_to_markdown(html);
@@ -638,5 +934,168 @@ mod tests {
         let result = html_table_to_markdown(html);
         // Should handle uneven rows without panicking
         assert!(result.contains("| A"));
+    }
+
+    #[test]
+    fn test_extract_and_clean_tables_basic() {
+        let html = "<p>Before table</p>\n<table>\n<tr><th>Name</th><th>Age</th></tr>\n<tr><td>Alice</td><td>30</td></tr>\n</table>\n<p>After table</p>";
+        eprintln!("Input HTML: {html:?}");
+
+        let (processed, tables) = extract_and_clean_tables(html);
+        eprintln!("Processed: {processed:?}");
+        eprintln!("Tables count: {}", tables.len());
+        for (i, t) in tables.iter().enumerate() {
+            eprintln!("Table {i}: {t:?}");
+        }
+
+        assert_eq!(tables.len(), 1, "Should have extracted 1 table");
+        assert!(processed.contains("TBLPLCHLDR0000"), "Processed should contain placeholder");
+        assert!(!processed.contains("<table>"), "Processed should not contain table tag");
+        assert!(!tables[0].contains('\t'), "Table should not contain tabs");
+        assert!(!tables[0].contains('\n'), "Table should not contain newlines");
+        assert!(!tables[0].contains("style"), "Table should not contain style attr");
+
+        // Test restoration
+        let markdown = format!("before\n{}\nafter", "TBLPLCHLDR0000");
+        let restored = restore_tables_in_markdown(&markdown, &tables);
+        eprintln!("Restored: {restored:?}");
+        assert!(restored.contains("<table>"), "Restored should contain table tag");
+    }
+
+    #[test]
+    fn test_extract_and_clean_tables_no_style() {
+        let html = "<p>text</p><table style=\"width:100%;border:1px\"><tr style=\"color:red\"><th style=\"font-weight:bold\">H</th></tr></table><p>text</p>";
+        let (processed, tables) = extract_and_clean_tables(html);
+        eprintln!("Table cleaned: {:?}", tables[0]);
+        assert!(!tables[0].contains("style"), "Style should be removed");
+    }
+
+    #[test]
+    fn test_extract_and_clean_tables_tabs_newlines() {
+        let html = "<p>text</p>\n<table>\n\t<tr>\n\t\t<td>A</td>\n\t</tr>\n</table>\n<p>text</p>";
+        let (processed, tables) = extract_and_clean_tables(html);
+        eprintln!("Table cleaned: {:?}", tables[0]);
+        assert!(!tables[0].contains('\t'), "Tabs should be removed");
+        assert!(!tables[0].contains('\n'), "Newlines should be removed");
+        assert_eq!(tables[0], "<table><tr><td>A</td></tr></table>");
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_basic() {
+        let html = "<p>text</p><li>A</li><li>B</li><p>text</p>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert_eq!(result, "<p>text</p><ul><li>A</li><li>B</li></ul><p>text</p>");
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_nested() {
+        let html = "<body><li>item1</li>\n<li>item2</li></body>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert!(result.contains("<ul>"));
+        assert!(result.contains("</ul>"));
+        assert!(result.contains("<li>item1</li>"));
+        assert!(result.contains("<li>item2</li>"));
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_skips_nested() {
+        let html = "<ul><li>A</li><li>B</li></ul>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert_eq!(result, "<ul><li>A</li><li>B</li></ul>");
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_preserves_body_text() {
+        let html = "<body>Are dress requirements in place of work important?</body>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert!(result.contains("Are dress requirements"), "text should be preserved");
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_preserves_chinese() {
+        let html = "<p>中文测试</p>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_no_li() {
+        let html = "<p>no list here</p>";
+        let result = wrap_orphan_lists(html);
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_preserves_table() {
+        let html = "<li>A</li><table><tr><td>cell</td></tr></table><li>B</li>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert!(result.starts_with("<ul><li>A</li></ul>"));
+        assert!(result.ends_with("<ul><li>B</li></ul>"));
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_real_world() {
+        let html = "<body><li>90 Second Half ends.</li>\n<li>90 Attempt missed.</li></body>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert_eq!(result, "<body><ul><li>90 Second Half ends.</li>\n<li>90 Attempt missed.</li></ul></body>");
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_inside_table() {
+        let html = "<table><tr><td><li>A</li><li>B</li></td><td>2</td></tr></table>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        // <li> inside <table> should NOT be wrapped in <ul>
+        assert_eq!(result, "<table><tr><td><li>A</li><li>B</li></td><td>2</td></tr></table>");
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_inside_table_and_outside() {
+        let html = "<li>outside1</li><table><tr><td><li>inside</li></td></tr></table><li>outside2</li>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert_eq!(result, "<ul><li>outside1</li></ul><table><tr><td><li>inside</li></td></tr></table><ul><li>outside2</li></ul>");
+    }
+
+    #[test]
+    fn test_wrap_orphan_lists_mixed() {
+        let html = "<ul><li>proper</li></ul><li>orphan1</li><li>orphan2</li><p>end</p>";
+        let result = wrap_orphan_lists(html);
+        eprintln!("result: {result:?}");
+        assert!(result.contains("<ul><li>proper</li></ul>"));
+        assert!(result.contains("<ul><li>orphan1</li><li>orphan2</li></ul>"));
+    }
+
+    #[test]
+    fn test_quick_html2md_preserves_placeholder() {
+        use quick_html2md::{html_to_markdown_with_options, MarkdownOptions};
+
+        let test_cases = vec![
+            ("<p>Before</p>\nTBL000\n<p>After</p>", "raw text"),
+            ("<p>Before</p>\n<p>TBL000</p>\n<p>After</p>", "in p tag"),
+            ("<p>Before</p>\n<div>TBL000</div>\n<p>After</p>", "in div tag"),
+            ("<p>Before</p>\n<span>TBL000</span>\n<p>After</p>", "in span tag"),
+            ("<p>Before</p>\n<!--TBL000-->\n<p>After</p>", "html comment"),
+        ];
+
+        let md_options = MarkdownOptions::new()
+            .include_links(true)
+            .include_images(true)
+            .preserve_tables(false)
+            .escape_special_chars(true);
+
+        for (html, desc) in &test_cases {
+            let markdown = html_to_markdown_with_options(html, &md_options);
+            let contains = markdown.contains("TBL000");
+            eprintln!("[{desc}] contains={contains}, output={markdown:?}");
+        }
     }
 }
