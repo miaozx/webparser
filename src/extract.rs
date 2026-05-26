@@ -150,13 +150,6 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
         COMMENTS_ARE_CONTENT.with(|c| c.set(true));
     }
 
-    // Save head title before doc_cleaning removes <head>/<title>/<meta> tags
-    let head_title = if !options.disable_title_anchored {
-        crate::title_anchored::parse_head_title(&document)
-    } else {
-        None
-    };
-
     // Clean document before content extraction (go-trafilatura: docCleaning)
     // Uses page-type-specific boilerplate selectors and preserve_tags.
     html_processing::doc_cleaning_with_profile(&document, options, &profile);
@@ -181,8 +174,9 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
     // - If length ratio > 0.95, pick the shorter result (more concise)
     // - Otherwise, pick the longer result (more content)
     if !options.disable_title_anchored {
-        use crate::title_anchored::{FeatureTree, find_content_by_anchor, locate_title_node};
+        use crate::title_anchored::{FeatureTree, find_content_by_anchor, locate_title_node, parse_head_title};
 
+        let head_title = parse_head_title(&doc_backup);
         let features = FeatureTree::build(&document);
         if let Some(ref head_title) = head_title {
             if let Some(title_node) = locate_title_node(&document, &head_title, Some(&features)) {
@@ -230,13 +224,16 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
 
     // Detect potential under-extraction: no paragraphs or table-heavy content
     // suggests wrong content was selected (e.g., footer, navigation, data table).
-    let under_extracted = if let Some(ref html) = content_html {
+    // Only consider under-extracted when text is also short — if text is long
+    // but HTML has no <p> tags (e.g., content inside <pre> or link-dense gallery),
+    // the text is still valid and shouldn't trigger fallback.
+    let mut under_extracted = if let Some(ref html) = content_html {
         let doc = Document::from(html.as_str());
         let p_count = doc.select("p").length();
         let table_count = doc.select("table").length();
         p_count == 0 || (table_count > 0 && table_count >= p_count)
     } else {
-        true // No HTML means definitely under-extracted
+        true
     };
 
     // Also check word count - navigation/footer often has few words but many chars
@@ -518,6 +515,9 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
                     cleaned_lines.push(trimmed);
                 } else if in_code_block {
                     cleaned_lines.push(line);
+                } else if trimmed == "-" || trimmed == "- " {
+                    // Skip empty list items (single dash)
+                    continue;
                 } else {
                     cleaned_lines.push(trimmed);
                 }
@@ -1558,7 +1558,7 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
     if extracted_from_content_node {
         if let Some(node) = &content_node {
             if let Some((merged_text, merged_html)) =
-                maybe_merge_split_article_bodies(node, options, &text, &html, used_relaxed_filtering, page_title)
+                maybe_merge_split_article_bodies(node, options, &text, &html, used_relaxed_filtering)
             {
                 text = merged_text;
                 html = merged_html;
@@ -1729,7 +1729,6 @@ fn maybe_merge_split_article_bodies(
     baseline_text: &str,
     baseline_html: &str,
     use_relaxed_filtering: bool,
-    page_title: Option<&str>,
 ) -> Option<(String, String)> {
     let baseline_len = baseline_text.trim().len();
     if baseline_len >= 5000 {
@@ -1775,7 +1774,7 @@ fn maybe_merge_split_article_bodies(
         let part_html = if use_relaxed_filtering {
             extract_filtered_html_allow_boilerplate(&chunk, options)
         } else {
-            extract_filtered_html_with_title(&chunk, options, page_title)
+            extract_filtered_html(&chunk, options)
         };
         if !part_html.trim().is_empty() {
             merged_html_parts.push(part_html);
@@ -2419,78 +2418,6 @@ fn excluded_tag_names() -> &'static [&'static str] {
 /// Shared content heuristics: check if an element should be excluded based on
 /// text-level analysis (link density, boilerplate patterns, title dedup).
 /// Used by both text and HTML extraction paths for consistent filtering.
-fn should_skip_element_for_content(
-    tag: &str,
-    el: &Selection,
-    options: &Options,
-    page_title: Option<&str>,
-) -> bool {
-    // Note: link density checks are text-path-specific. They behave
-    // differently in children vs descendants traversal and are excluded
-    // here to keep HTML path consistent with text path output.
-
-    // Heading-specific filtering
-    let is_heading = tag.len() == 2
-        && tag.starts_with('h')
-        && tag.chars().nth(1).map_or(false, |c| c.is_ascii_digit());
-
-    if is_heading {
-        let heading_text = etree::iter_text(el, " ");
-        let heading_text_trimmed = heading_text.trim();
-
-        if html_processing::is_share_button_text(heading_text_trimmed) {
-            return true;
-        }
-
-        if let Some(class) = dom::get_attribute(el, "class") {
-            let class_lower = class.to_ascii_lowercase();
-            if class_lower.contains("entry-title")
-                || class_lower.contains("post-title")
-                || class_lower.contains("article-title")
-                || class_lower.contains("story-title")
-                || class_lower.contains("pg-headline")
-                || class_lower.contains("headline")
-            {
-                return true;
-            }
-        }
-
-        if let Some(itemprop) = dom::get_attribute(el, "itemprop") {
-            if itemprop.to_ascii_lowercase() == "headline" {
-                return true;
-            }
-        }
-
-        if tag.eq_ignore_ascii_case("h1") {
-            if let Some(title) = page_title {
-                if titles_match(heading_text_trimmed, title) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Short paragraphs that are entirely boilerplate text
-    if tag == "p" {
-        let p_text = etree::iter_text(el, " ");
-        let p_text_trimmed = p_text.trim();
-        if p_text_trimmed.len() < 50 && html_processing::is_share_button_text(p_text_trimmed) {
-            return true;
-        }
-    }
-
-    // Short divs that are entirely boilerplate text
-    if tag == "div" {
-        let div_text = etree::iter_text(el, " ");
-        let div_text_trimmed = div_text.trim();
-        if div_text_trimmed.len() < 80 && html_processing::is_share_button_text(div_text_trimmed) {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn extract_filtered_text_inner(
     root: &Selection,
     options: &Options,
@@ -3006,11 +2933,6 @@ fn push_filtered_html_children(
                 }
             }
 
-            // Shared content heuristics (link density, title dedup, share button patterns)
-            if should_skip_element_for_content(&tag, &el, options, page_title) {
-                continue;
-            }
-
             let next_inside_article_or_main = inside_article_or_main || matches!(tag.as_str(), "article" | "main");
 
             if inside_layout_table
@@ -3051,6 +2973,20 @@ fn push_filtered_html_children(
                     page_title,
                 );
                 continue;
+            }
+
+            // Skip h1 headings that match the page title (article headline duplicated in body)
+            if tag == "h1" {
+                if let Some(title) = page_title {
+                    let heading_sel = Selection::from(child_node);
+                    let heading_text = etree::iter_text(&heading_sel, " ");
+                    let heading_text_trimmed = heading_text.trim();
+                    if !heading_text_trimmed.is_empty()
+                        && titles_match(heading_text_trimmed, title)
+                    {
+                        continue;
+                    }
+                }
             }
 
             if matches!(
@@ -3211,6 +3147,7 @@ fn is_always_excluded_name(name: &str) -> bool {
         || name.contains("zn-body__read-more")
         || name.contains("js-body-read-more")
         || name.contains("pg-headline")
+        || name.contains("pagenum")
 }
 
 fn parse_usize_attr(value: Option<&str>, default: usize) -> usize {
