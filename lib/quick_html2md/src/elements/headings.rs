@@ -18,6 +18,9 @@ pub(crate) fn convert_heading(
     level: usize,
     depth: usize,
 ) {
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
     if level <= options.max_heading_level as usize && level < HEADING_PREFIXES.len() {
         output.push_str(HEADING_PREFIXES[level]);
         convert_inline_content(sel, output, options, depth);
