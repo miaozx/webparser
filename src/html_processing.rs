@@ -210,6 +210,24 @@ fn doc_cleaning_inner(doc: &Document, opts: &Options, preserve_tags: &[&str]) {
         // Remove "footer" from bulk removal — already handled above contextually
         cleaning_opts.tags_to_remove.retain(|t| t != "footer");
 
+        // Heuristic: preserve <form> when it contains most of the page's text.
+        // Many CMS platforms (DotNetNuke, SharePoint, etc.) wrap main content
+        // inside <form> elements. Blindly removing <form> destroys the content.
+        // But some pages have actual forms (search, login) that should be removed.
+        // Check: if form text > 50% of body text, keep the form.
+        if cleaning_opts.tags_to_remove.iter().any(|t| t == "form") {
+            let body_text = doc.select("body").text();
+            let body_text_len = body_text.trim().chars().count();
+            if body_text_len > 0 {
+                let form_text_len: usize = doc.select("form").nodes().iter()
+                    .map(|n| Selection::from(*n).text().trim().chars().count())
+                    .sum();
+                if form_text_len > body_text_len / 2 {
+                    cleaning_opts.tags_to_remove.retain(|t| t != "form");
+                }
+            }
+        }
+
         // Remove tags that the page type profile wants to preserve
         if !preserve_tags.is_empty() {
             cleaning_opts.tags_to_remove.retain(|t| !preserve_tags.contains(&t.as_str()));
