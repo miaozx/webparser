@@ -28,7 +28,7 @@ fn collect_link_info(links: &Selection) -> (usize, usize, usize) {
     for link in links.iter() {
         let text = link.text().to_string();
         let text = text.trim();
-        let text_length = text.chars().count();
+    let text_length = text.chars().count();
 
         if text_length == 0 {
             continue;
@@ -63,7 +63,11 @@ pub fn link_density_test(element: &Selection, options: &Options) -> bool {
     // EPIC-05: Remove unnecessary .to_string() - use StrTendril directly
     // Note: trim() returns &str, so we must bind the StrTendril first
     let text_tendril = dom::text_content(element);
-    let text = text_tendril.trim();
+    let text_raw = text_tendril.trim();
+    // Normalize internal whitespace — dom::text_content includes all whitespace
+    // between table cells, formatting, etc., which inflates text_length and
+    // dilutes link density (e.g., a fully-linked table appears low-density).
+    let text: String = text_raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let text_length = text.chars().count();
 
     // Shortcut for single link
@@ -123,10 +127,12 @@ pub fn link_density_test(element: &Selection, options: &Options) -> bool {
     }
 
     // Extended check for larger elements: link-dense containers without paragraphs.
-    // Nav sections (menus, filter panels, related links) typically have 5+ links,
+    // Nav sections (menus, filter panels, related links) typically have 3+ links,
     // high link density, and NO <p> paragraph children. Content sections always
     // have paragraphs interspersed with links.
-    if n_links >= 5 && tag_name != "p" {
+    // Lowered from 5 to 3 to catch smaller nav containers (breadcrumbs,
+    // sidebar link lists, tag clouds) that have few links but are dense.
+    if n_links >= 3 && tag_name != "p" {
         let has_paragraphs = element.select("p").length() > 0;
         if !has_paragraphs {
             let (link_length, n_short_links, n_non_empty_links) = collect_link_info(&links);
@@ -136,6 +142,11 @@ pub fn link_density_test(element: &Selection, options: &Options) -> bool {
 
                 // High link density + mostly short links + no paragraphs = navigation
                 if link_density > 0.5 && short_ratio > 0.5 {
+                    return true;
+                }
+                // Very high link density (>80%) alone is navigation even if links
+                // are longer (e.g., nav with "Sustainability", "Investor Centre").
+                if link_density > 0.8 {
                     return true;
                 }
             }
@@ -262,7 +273,9 @@ pub fn link_density_test_tables(table: &Selection, _options: &Options) -> bool {
     // EPIC-05: Remove unnecessary .to_string() - use StrTendril directly
     // Note: trim() returns &str, so we must bind the StrTendril first
     let text_tendril = dom::text_content(table);
-    let text = text_tendril.trim();
+    let text_raw = text_tendril.trim();
+    // Normalize whitespace (same as link_density_test)
+    let text: String = text_raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let text_length = text.chars().count();
 
     if text_length < 200 {

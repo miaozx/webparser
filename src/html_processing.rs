@@ -214,7 +214,8 @@ fn doc_cleaning_inner(doc: &Document, opts: &Options, preserve_tags: &[&str]) {
         // Many CMS platforms (DotNetNuke, SharePoint, etc.) wrap main content
         // inside <form> elements. Blindly removing <form> destroys the content.
         // But some pages have actual forms (search, login) that should be removed.
-        // Check: if form text > 50% of body text, keep the form.
+        // Check: if form text > 40% of body text, keep the form.
+        // Using 40% (vs 50%) because JS-heavy forms inflate the count.
         if cleaning_opts.tags_to_remove.iter().any(|t| t == "form") {
             let body_text = doc.select("body").text();
             let body_text_len = body_text.trim().chars().count();
@@ -222,7 +223,7 @@ fn doc_cleaning_inner(doc: &Document, opts: &Options, preserve_tags: &[&str]) {
                 let form_text_len: usize = doc.select("form").nodes().iter()
                     .map(|n| Selection::from(*n).text().trim().chars().count())
                     .sum();
-                if form_text_len > body_text_len / 2 {
+                if form_text_len > body_text_len * 40 / 100 {
                     cleaning_opts.tags_to_remove.retain(|t| t != "form");
                 }
             }
@@ -239,10 +240,13 @@ fn doc_cleaning_inner(doc: &Document, opts: &Options, preserve_tags: &[&str]) {
             cleaning_opts.tags_to_strip.retain(|t| t != "img");
         }
 
-        // Conditional: exclude tables — add table tags to removal
+        // Conditional: exclude tables — strip table tags but keep content
+        // Using tags_to_strip (remove tag, keep children) instead of tags_to_remove
+        // (remove tag and children), so table-wrapped content inside forms or
+        // layout tables is still available for text extraction.
         if !opts.include_tables {
             for tag in &["table", "td", "th", "tr"] {
-                cleaning_opts.tags_to_remove.push((*tag).to_string());
+                cleaning_opts.tags_to_strip.push((*tag).to_string());
             }
         }
 

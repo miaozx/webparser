@@ -1072,9 +1072,32 @@ fn compute_extraction_quality_heuristic(
 }
 
 fn count_words(text: &str, min_length: usize) -> usize {
-    text.split_whitespace()
-        .filter(|w| w.len() >= min_length)
-        .count()
+    // Check if text is CJK-dominated (Chinese, Japanese, Korean).
+    // For CJK text, whitespace splitting is meaningless — every character
+    // is roughly a word. Count non-whitespace characters instead.
+    let cjk_count = text.chars().filter(|c| {
+        let code = *c as u32;
+        (code >= 0x2E80 && code <= 0x2EFF)  // CJK Radicals Supplement
+            || (code >= 0x3000 && code <= 0x303F)  // CJK Symbols and Punctuation
+            || (code >= 0x3200 && code <= 0x33FF)  // CJK Compatibility
+            || (code >= 0x3400 && code <= 0x4DBF)  // CJK Unified Ideographs Extension A
+            || (code >= 0x4E00 && code <= 0x9FFF)  // CJK Unified Ideographs
+            || (code >= 0xF900 && code <= 0xFAFF)  // CJK Compatibility Ideographs
+            || (code >= 0xFE30 && code <= 0xFE4F)  // CJK Compatibility Forms
+            || (code >= 0x3040 && code <= 0x309F)  // Hiragana (Japanese)
+            || (code >= 0x30A0 && code <= 0x30FF)  // Katakana (Japanese)
+            || (code >= 0xAC00 && code <= 0xD7AF)  // Hangul (Korean)
+    }).count();
+
+    if cjk_count >= text.chars().count() / 2 {
+        // CJK text: count non-whitespace characters as "words"
+        text.chars().filter(|c| !c.is_whitespace()).count()
+    } else {
+        // Western text: split by whitespace
+        text.split_whitespace()
+            .filter(|w| w.len() >= min_length)
+            .count()
+    }
 }
 
 /// Attempts fallback extraction when main extraction produces insufficient content.
@@ -1206,6 +1229,11 @@ fn apply_final_validations(
         ));
     }
 
+    // Remove copyright boilerplate paragraphs from content text.
+    // This is a post-processing step that catches copyright notices
+    // introduced by any extraction path (initial, TA, fallback, etc.).
+    result.content_text = strip_copyright_lines(&result.content_text);
+
     // Validate comments section
     if let Some(ref comments) = result.comments_text {
         let comm_word_count = count_words(comments, options.min_word_length);
@@ -1220,6 +1248,82 @@ fn apply_final_validations(
     }
 
     Ok(result)
+}
+
+/// Remove copyright boilerplate from extracted text.
+/// Handles two cases:
+/// 1. Lines that ARE copyright notices (no real content) → removed entirely
+/// 2. Lines where copyright is a suffix after real content → suffix stripped
+fn strip_copyright_lines(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut first = true;
+    for line in text.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !first {
+                result.push('\n');
+            }
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        let has_symbol = trimmed.contains('©');
+        let has_copyright = lower.contains("copyright");
+        let has_rights = lower.contains("all rights reserved")
+            || lower.contains("版权所有");
+        let has_year = trimmed.chars().any(|c| c.is_ascii_digit())
+            && trimmed.contains("20");
+
+        // Determine the position where copyright text starts
+        let copyright_start = lower.find("copyright")
+            .or_else(|| trimmed.find('©'));
+
+        if let Some(start) = copyright_start {
+            // Check if it's a real copyright notice (has rights + year alongside)
+            // vs just content mentioning "copyright law" etc.
+            if !(has_rights || has_year) {
+                // Not a copyright notice, keep as-is
+                append_line(&mut result, trimmed, &mut first);
+                continue;
+            }
+            let preceding = trimmed[..start].trim();
+            if preceding.is_empty() || preceding.len() < 20 {
+                // No meaningful content before copyright → pure notice → skip
+                continue;
+            }
+            // Has content before copyright → keep content, strip suffix
+            if !first {
+                result.push('\n');
+            }
+            result.push_str(preceding);
+            first = false;
+        } else if lower.contains("版权所有") {
+            if trimmed.len() < 100 {
+                // Pure Chinese copyright notice → skip
+                continue;
+            }
+            // Has content before copyright → check for copyright suffix
+            if let Some(cn_pos) = lower.rfind("版权所有") {
+                let preceding = trimmed[..cn_pos].trim();
+                if !preceding.is_empty() {
+                    append_line(&mut result, preceding, &mut first);
+                }
+            }
+        } else {
+            append_line(&mut result, trimmed, &mut first);
+        }
+    }
+    return result;
+
+    fn append_line(out: &mut String, line: &str, first: &mut bool) {
+        if !*first {
+            out.push('\n');
+        }
+        out.push_str(line);
+        *first = false;
+    }
 }
 
 /// Strip sections from content HTML that are link-dense navigation boilerplate.
@@ -1454,6 +1558,13 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
         if let Some(node) = &content_node {
             if let Some(tag) = dom::tag_name(node) {
                 eprintln!("DEBUG: Found content node with tag: {tag}");
+                if let Some(cls) = node.attr("class") {
+                    if !cls.is_empty() {
+                        eprintln!("DEBUG: content node class={cls:?}");
+                    }
+                }
+                // Also show text length
+                eprintln!("DEBUG: content text length: {} chars", node.text().trim().len());
             }
         } else {
             eprintln!("DEBUG: No semantic content node found, will use body extraction");
@@ -1515,14 +1626,21 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
             // Finds the content node by scoring paragraphs and propagating
             // scores to parent containers. Works when the top-down heuristic
             // picked the wrong node entirely OR when no node was found.
+            // Only use bottom-up when the current content has no paragraphs
+            // (indicating navigation/boilerplate) — if we already have <p> content,
+            // the current node is likely the correct article.
             if !improved || text.chars().count() < 1000 {
-                if let Some(bu_node) = find_content_node_bottom_up(doc) {
-                    let bu_text = extract_filtered_text_with_title(&bu_node, options, page_title);
-                    let bu_len = bu_text.chars().count();
-                    let current_len = text.chars().count();
-                    if bu_len > current_len * 2 && bu_len > 500 {
-                        text = bu_text;
-                        html = extract_filtered_html_with_title(&bu_node, options, page_title);
+                let current_has_paragraphs = !html.is_empty()
+                    && Document::from(html.as_str()).select("p").length() > 0;
+                if !current_has_paragraphs {
+                    if let Some(bu_node) = find_content_node_bottom_up(doc) {
+                        let bu_text = extract_filtered_text_with_title(&bu_node, options, page_title);
+                        let bu_len = bu_text.chars().count();
+                        let current_len = text.chars().count();
+                        if bu_len > current_len * 2 && bu_len > 500 {
+                            text = bu_text;
+                            html = extract_filtered_html_with_title(&bu_node, options, page_title);
+                        }
                     }
                 }
             }
@@ -2645,6 +2763,7 @@ fn extract_filtered_text_inner(
                 t.eq_ignore_ascii_case("div")
                     || t.eq_ignore_ascii_case("ul")
                     || t.eq_ignore_ascii_case("ol")
+                    || t.eq_ignore_ascii_case("li")
             });
 
             // Handle table elements based on include_tables option
@@ -2657,9 +2776,11 @@ fn extract_filtered_text_inner(
                     continue;
                 }
 
+                let is_layout = is_layout_table(&table);
+
                 if options.include_tables {
                     // Extract table content with special formatting
-                    if !is_layout_table(&table) {
+                    if !is_layout {
                         let table_text = extract_table_text(&table);
                         if !table_text.is_empty() {
                             out.push_str("\n\n");
@@ -2669,11 +2790,14 @@ fn extract_filtered_text_inner(
                         skip_depths.push(depth);
                         continue;
                     }
-                } else {
-                    // Skip table and all its descendants when include_tables is false
-                    skip_depths.push(depth);
-                    continue;
+                } else if !is_layout {
+                    // include_tables is false: skip data table formatting but
+                    // still process children as regular content (strip table tags).
+                    // Data tables that contain actual content (not just navigation)
+                    // should not lose their content just because of the table wrapper.
                 }
+                // Layout table or include_tables=false for data tables:
+                // fall through, process children as regular text
             }
 
             // Check link density for div and list elements - skip if mostly links (navigation containers)
@@ -2683,6 +2807,28 @@ fn extract_filtered_text_inner(
                 if link_density_test(&element, options) {
                     skip_depths.push(depth);
                     continue;
+                }
+            }
+
+            // Skip interactive UI elements (buttons, form controls) that are
+            // not real content — they have role="button", tabindex, or match
+            // common interactive class patterns.
+            if let Some(tag_name) = node.node_name() {
+                if tag_name.eq_ignore_ascii_case("div")
+                    || tag_name.eq_ignore_ascii_case("span")
+                {
+                    let el = Selection::from(node);
+                    let has_button_role = el.attr("role").is_some_and(|r| {
+                        r.eq_ignore_ascii_case("button")
+                            || r.eq_ignore_ascii_case("combobox")
+                            || r.eq_ignore_ascii_case("listbox")
+                            || r.eq_ignore_ascii_case("tab")
+                    });
+                    let has_tabindex = el.attr("tabindex").is_some();
+                    if has_button_role || has_tabindex {
+                        skip_depths.push(depth);
+                        continue;
+                    }
                 }
             }
 
@@ -2767,6 +2913,38 @@ fn extract_filtered_text_inner(
                     if div_text_trimmed.len() < 80 && html_processing::is_share_button_text(div_text_trimmed) {
                         skip_depths.push(depth);
                         continue;
+                    }
+                }
+
+                // Filter copyright boilerplate in block elements.
+                // Only match when the ENTIRE element is a copyright notice (short text,
+                // multiple copyright signals), not content that merely mentions "copyright".
+                if tag_name.eq_ignore_ascii_case("p") || tag_name.eq_ignore_ascii_case("div") {
+                    let el_sel = Selection::from(node);
+                    let el_text = etree::iter_text(&el_sel, " ");
+                    let el_text_trimmed = el_text.trim();
+                    if el_text_trimmed.len() < 200 {
+                        let el_lower = el_text_trimmed.to_lowercase();
+                        let has_copyright = el_lower.contains("copyright");
+                        let has_symbol = el_lower.contains('©')
+                            || el_text_trimmed.contains("©");
+                        let has_rights = el_lower.contains("all rights reserved")
+                            || el_lower.contains("版权所有");
+                        let has_year = el_text_trimmed.chars().any(|c| c.is_ascii_digit())
+                            && el_text_trimmed.contains("20");
+                        // Must have copyright signal + rights or year to confirm it's
+                        // a notice (not content that merely mentions "copyright")
+                        if (has_copyright || has_symbol) && (has_rights || has_year) {
+                            skip_depths.push(depth);
+                            continue;
+                        }
+                        // Chinese-only: 版权所有 alone is sufficient (not used in prose)
+                        if el_lower.contains("版权所有")
+                            && el_text_trimmed.len() < 100
+                        {
+                            skip_depths.push(depth);
+                            continue;
+                        }
                     }
                 }
 
@@ -2898,6 +3076,11 @@ fn push_filtered_html_children(
                 continue;
             }
 
+            // Skip form control / interactive input elements
+            if matches!(tag.as_str(), "select" | "option" | "input" | "textarea" | "button") {
+                continue;
+            }
+
             if let Some(class) = el.attr("class") {
                 if is_always_excluded_name(&class) {
                     continue;
@@ -2933,7 +3116,123 @@ fn push_filtered_html_children(
                 }
             }
 
+            // Skip link-dense list and item elements (navigation, related links, etc.)
+            if matches!(tag.as_str(), "ul" | "ol") && link_density_test(&el, options) {
+                continue;
+            }
+
+            // Skip link-dense div containers (sidebars, nav panels, etc.)
+            if tag == "div" && link_density_test(&el, options) {
+                continue;
+            }
+
+            // Skip link-dense list items (product grids, link lists)
+            if tag == "li" && link_density_test(&el, options) {
+                continue;
+            }
+
+            // Skip link-dense div containers (sidebars, nav panels, etc.)
+            if tag == "div" && link_density_test(&el, options) {
+                continue;
+            }
+
             let next_inside_article_or_main = inside_article_or_main || matches!(tag.as_str(), "article" | "main");
+
+            // Skip link-dense tables (navigation-heavy tables)
+            if tag == "table" && link_density_test_tables(&el, options) {
+                continue;
+            }
+
+            // Heading boilerplate filters (consistent with text extraction path)
+            let is_heading = tag.len() == 2
+                && tag.starts_with('h')
+                && tag.as_bytes()[1].is_ascii_digit();
+
+            if is_heading {
+                let heading_text = etree::iter_text(&el, " ");
+                let heading_text_trimmed = heading_text.trim();
+
+                // Skip headings with boilerplate patterns (newsletter CTAs, etc.)
+                if html_processing::is_share_button_text(heading_text_trimmed) {
+                    continue;
+                }
+
+                // Skip headings with title/headline class markers
+                if let Some(class) = el.attr("class") {
+                    let class_lower = class.to_ascii_lowercase();
+                    if class_lower.contains("entry-title")
+                        || class_lower.contains("post-title")
+                        || class_lower.contains("article-title")
+                        || class_lower.contains("story-title")
+                        || class_lower.contains("pg-headline")
+                        || class_lower.contains("headline")
+                    {
+                        continue;
+                    }
+                }
+
+                // Skip headings with itemprop="headline"
+                if let Some(itemprop) = el.attr("itemprop") {
+                    if itemprop.to_ascii_lowercase() == "headline" {
+                        continue;
+                    }
+                }
+            }
+
+            // Short paragraph boilerplate filter (consistent with text path)
+            if tag == "p" {
+                let p_text = etree::iter_text(&el, " ");
+                let p_text_trimmed = p_text.trim();
+                if p_text_trimmed.len() < 50 && html_processing::is_share_button_text(p_text_trimmed) {
+                    continue;
+                }
+            }
+
+            // Short div boilerplate filter (consistent with text path)
+            if tag == "div" {
+                let div_text = etree::iter_text(&el, " ");
+                let div_text_trimmed = div_text.trim();
+                if div_text_trimmed.len() < 80 && html_processing::is_share_button_text(div_text_trimmed) {
+                    continue;
+                }
+            }
+
+            // Filter copyright boilerplate (both p and div).
+            // Multiple signals required to avoid filtering content that merely
+            // mentions "copyright" (e.g., "Copyright Law: A Guide").
+            if matches!(tag.as_str(), "p" | "div") {
+                let ce_text = etree::iter_text(&el, " ");
+                let ce_text_trimmed = ce_text.trim();
+                if ce_text_trimmed.len() < 200 {
+                    let ce_lower = ce_text_trimmed.to_lowercase();
+                    let has_copyright = ce_lower.contains("copyright");
+                    let has_symbol = ce_text_trimmed.contains('©');
+                    let has_rights = ce_lower.contains("all rights reserved")
+                        || ce_lower.contains("版权所有");
+                    let has_year = ce_text_trimmed.chars().any(|c| c.is_ascii_digit())
+                        && ce_text_trimmed.contains("20");
+                    if (has_copyright || has_symbol) && (has_rights || has_year) {
+                        continue;
+                    }
+                    if ce_lower.contains("版权所有") && ce_text_trimmed.len() < 100 {
+                        continue;
+                    }
+                }
+            }
+
+            // Interactive UI elements (buttons, comboboxes, tabs)
+            if tag == "div" || tag == "span" {
+                let has_button_role = el.attr("role").is_some_and(|r| {
+                    r.eq_ignore_ascii_case("button")
+                        || r.eq_ignore_ascii_case("combobox")
+                        || r.eq_ignore_ascii_case("listbox")
+                        || r.eq_ignore_ascii_case("tab")
+                });
+                let has_tabindex = el.attr("tabindex").is_some();
+                if has_button_role || has_tabindex {
+                    continue;
+                }
+            }
 
             if inside_layout_table
                 && matches!(
