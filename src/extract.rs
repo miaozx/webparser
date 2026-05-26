@@ -225,9 +225,14 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
     // Detect potential under-extraction: no paragraphs or table-heavy content
     // suggests wrong content was selected (e.g., footer, navigation, data table).
     // Only consider under-extracted when text is also short — if text is long
-    // but HTML has no <p> tags (e.g., content inside <pre> or link-dense gallery),
-    // the text is still valid and shouldn't trigger fallback.
-    let mut under_extracted = if let Some(ref html) = content_html {
+    // but HTML has no <p> tags (e.g., content inside <pre> or link-dense gallery,
+    // Korean/Chinese content inside <td><span><font>), the text is still valid
+    // and shouldn't trigger fallback.
+    let mut under_extracted = if content_len > 500 {
+        // Content is substantial — don't flag as under-extracted even if
+        // no <p> tags (content may be in table cells, spans, etc.)
+        false
+    } else if let Some(ref html) = content_html {
         let doc = Document::from(html.as_str());
         let p_count = doc.select("p").length();
         let table_count = doc.select("table").length();
@@ -1563,7 +1568,6 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
                         eprintln!("DEBUG: content node class={cls:?}");
                     }
                 }
-                // Also show text length
                 eprintln!("DEBUG: content text length: {} chars", node.text().trim().len());
             }
         } else {

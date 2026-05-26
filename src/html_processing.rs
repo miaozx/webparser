@@ -229,6 +229,22 @@ fn doc_cleaning_inner(doc: &Document, opts: &Options, preserve_tags: &[&str]) {
             }
         }
 
+        // Heuristic: preserve <menu> when it contains most of the page's text.
+        // HTML5 <menu> is occasionally used as a generic content wrapper
+        // (not just navigation), and removing it destroys the page content.
+        if cleaning_opts.tags_to_remove.iter().any(|t| t == "menu") {
+            let body_text = doc.select("body").text();
+            let body_text_len = body_text.trim().chars().count();
+            if body_text_len > 0 {
+                let menu_text_len: usize = doc.select("menu").nodes().iter()
+                    .map(|n| Selection::from(*n).text().trim().chars().count())
+                    .sum();
+                if menu_text_len > body_text_len * 40 / 100 {
+                    cleaning_opts.tags_to_remove.retain(|t| t != "menu");
+                }
+            }
+        }
+
         // Remove tags that the page type profile wants to preserve
         if !preserve_tags.is_empty() {
             cleaning_opts.tags_to_remove.retain(|t| !preserve_tags.contains(&t.as_str()));
