@@ -150,6 +150,13 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
         COMMENTS_ARE_CONTENT.with(|c| c.set(true));
     }
 
+    // Save head title before doc_cleaning removes <head>/<title>/<meta> tags
+    let head_title = if !options.disable_title_anchored {
+        crate::title_anchored::parse_head_title(&document)
+    } else {
+        None
+    };
+
     // Clean document before content extraction (go-trafilatura: docCleaning)
     // Uses page-type-specific boilerplate selectors and preserve_tags.
     html_processing::doc_cleaning_with_profile(&document, options, &profile);
@@ -168,6 +175,50 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
             (String::new(), None)
         }
     };
+
+    // Try title-anchored extraction as an independent alternative strategy.
+    // Compares normal extraction with title-anchored result:
+    // - If length ratio > 0.95, pick the shorter result (more concise)
+    // - Otherwise, pick the longer result (more content)
+    if !options.disable_title_anchored {
+        use crate::title_anchored::{FeatureTree, find_content_by_anchor, locate_title_node};
+
+        let features = FeatureTree::build(&document);
+        if let Some(ref head_title) = head_title {
+            if let Some(title_node) = locate_title_node(&document, &head_title, Some(&features)) {
+                if let Some(ta_node) = find_content_by_anchor(&document, &features, &title_node) {
+                        let ta_text = extract_filtered_text_with_title(&ta_node, options, page_title);
+                        let ta_html = extract_filtered_html_with_title(&ta_node, options, page_title);
+                        let ta_len = ta_text.chars().count();
+                        let normal_len = content_text.chars().count();
+
+                    if ta_len > 0 && normal_len > 0 {
+                        let (shorter, longer) = if ta_len < normal_len {
+                            (ta_len, normal_len)
+                        } else {
+                            (normal_len, ta_len)
+                        };
+                        let ratio = shorter as f64 / longer as f64;
+                        let use_ta = if ratio > 0.95 {
+                            ta_len < normal_len
+                        } else {
+                            ta_len > normal_len
+                        };
+                        if use_ta {
+                            content_text = ta_text;
+                            content_html = Some(ta_html);
+                        }
+                    } else if ta_len > 0 {
+                        content_text = ta_text;
+                        content_html = Some(ta_html);
+                    }
+                    if ta_len > 0 {
+                        TA_USED.with(|c| c.set(true));
+                    }
+                }
+            }
+        }
+    }
 
     // Try fallback extraction when main extraction may be insufficient
     // Only trigger when content is potentially under-extracted, following original RS logic.
@@ -241,7 +292,6 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
                         "Used multi-candidate merge: {merged_len} chars (was {current_len} chars)"
                     ));
                     content_text = merged;
-                    content_html = None;
                 }
             }
         }
@@ -260,7 +310,6 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
                         "Used repeated-item collection: {coll_len} chars (was {current_len} chars)"
                     ));
                     content_text = collected;
-                    content_html = None;
                 }
             }
         }
@@ -280,7 +329,6 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
                 let desc_len = desc.chars().count();
                 if desc_len >= 50 {
                     content_text = format!("{desc}\n\n{content_text}");
-                    content_html = None;
                 }
             }
         }
@@ -314,7 +362,11 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
                 "Using JSON-LD Product description: {desc_len} chars (DOM was {current_len} chars, overlap {:.0}%)", overlap_ratio * 100.0
             ));
             content_text.clone_from(product_desc);
-            content_html = None;
+            let escaped = product_desc
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            content_html = Some(format!("<p>{escaped}</p>"));
         }
     }
 
@@ -429,8 +481,6 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
             use crate::markdown::{extract_and_clean_tables, restore_tables_in_markdown, wrap_orphan_lists};
             use quick_html2md::{html_to_markdown_with_options, MarkdownOptions};
 
-            // Wrap orphan <li> elements (not inside <ul>/<ol>) in <ul> tags
-            // so quick_html2md can convert them to markdown lists
             let fixed_html = wrap_orphan_lists(html);
 
             // Extract tables from HTML, clean them (strip style, remove tabs/newlines),
@@ -1412,7 +1462,7 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
 
     let (mut text, mut html) = if let Some(node) = &content_node {
         let text = extract_filtered_text_with_title(node, options, page_title);
-        let html = extract_filtered_html(node, options);
+        let html = extract_filtered_html_with_title(node, options, page_title);
         if cfg!(debug_assertions) {
             eprintln!("DEBUG: Extracted from content node: {} chars", text.len());
         }
@@ -1452,7 +1502,7 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
                         let anc_len = anc_text.chars().count();
                         if anc_len > text_len * 2 {
                             text = anc_text;
-                            html = extract_filtered_html(&ancestor, options);
+                            html = extract_filtered_html_with_title(&ancestor, options, page_title);
                             improved = true;
                             break;
                         }
@@ -1472,7 +1522,7 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
                     let current_len = text.chars().count();
                     if bu_len > current_len * 2 && bu_len > 500 {
                         text = bu_text;
-                        html = extract_filtered_html(&bu_node, options);
+                        html = extract_filtered_html_with_title(&bu_node, options, page_title);
                     }
                 }
             }
@@ -1508,7 +1558,7 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
     if extracted_from_content_node {
         if let Some(node) = &content_node {
             if let Some((merged_text, merged_html)) =
-                maybe_merge_split_article_bodies(node, options, &text, &html, used_relaxed_filtering)
+                maybe_merge_split_article_bodies(node, options, &text, &html, used_relaxed_filtering, page_title)
             {
                 text = merged_text;
                 html = merged_html;
@@ -1679,6 +1729,7 @@ fn maybe_merge_split_article_bodies(
     baseline_text: &str,
     baseline_html: &str,
     use_relaxed_filtering: bool,
+    page_title: Option<&str>,
 ) -> Option<(String, String)> {
     let baseline_len = baseline_text.trim().len();
     if baseline_len >= 5000 {
@@ -1724,7 +1775,7 @@ fn maybe_merge_split_article_bodies(
         let part_html = if use_relaxed_filtering {
             extract_filtered_html_allow_boilerplate(&chunk, options)
         } else {
-            extract_filtered_html(&chunk, options)
+            extract_filtered_html_with_title(&chunk, options, page_title)
         };
         if !part_html.trim().is_empty() {
             merged_html_parts.push(part_html);
@@ -2365,6 +2416,81 @@ fn excluded_tag_names() -> &'static [&'static str] {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Shared content heuristics: check if an element should be excluded based on
+/// text-level analysis (link density, boilerplate patterns, title dedup).
+/// Used by both text and HTML extraction paths for consistent filtering.
+fn should_skip_element_for_content(
+    tag: &str,
+    el: &Selection,
+    options: &Options,
+    page_title: Option<&str>,
+) -> bool {
+    // Note: link density checks are text-path-specific. They behave
+    // differently in children vs descendants traversal and are excluded
+    // here to keep HTML path consistent with text path output.
+
+    // Heading-specific filtering
+    let is_heading = tag.len() == 2
+        && tag.starts_with('h')
+        && tag.chars().nth(1).map_or(false, |c| c.is_ascii_digit());
+
+    if is_heading {
+        let heading_text = etree::iter_text(el, " ");
+        let heading_text_trimmed = heading_text.trim();
+
+        if html_processing::is_share_button_text(heading_text_trimmed) {
+            return true;
+        }
+
+        if let Some(class) = dom::get_attribute(el, "class") {
+            let class_lower = class.to_ascii_lowercase();
+            if class_lower.contains("entry-title")
+                || class_lower.contains("post-title")
+                || class_lower.contains("article-title")
+                || class_lower.contains("story-title")
+                || class_lower.contains("pg-headline")
+                || class_lower.contains("headline")
+            {
+                return true;
+            }
+        }
+
+        if let Some(itemprop) = dom::get_attribute(el, "itemprop") {
+            if itemprop.to_ascii_lowercase() == "headline" {
+                return true;
+            }
+        }
+
+        if tag.eq_ignore_ascii_case("h1") {
+            if let Some(title) = page_title {
+                if titles_match(heading_text_trimmed, title) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Short paragraphs that are entirely boilerplate text
+    if tag == "p" {
+        let p_text = etree::iter_text(el, " ");
+        let p_text_trimmed = p_text.trim();
+        if p_text_trimmed.len() < 50 && html_processing::is_share_button_text(p_text_trimmed) {
+            return true;
+        }
+    }
+
+    // Short divs that are entirely boilerplate text
+    if tag == "div" {
+        let div_text = etree::iter_text(el, " ");
+        let div_text_trimmed = div_text.trim();
+        if div_text_trimmed.len() < 80 && html_processing::is_share_button_text(div_text_trimmed) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn extract_filtered_text_inner(
     root: &Selection,
     options: &Options,
@@ -2741,43 +2867,77 @@ fn extract_filtered_text_inner(
 }
 
 fn extract_filtered_html(root: &Selection, options: &Options) -> String {
-    extract_filtered_html_inner(root, options, true)
+    extract_filtered_html_inner(root, options, true, None)
+}
+
+fn extract_filtered_html_with_title(root: &Selection, options: &Options, page_title: Option<&str>) -> String {
+    extract_filtered_html_inner(root, options, true, page_title)
 }
 
 fn extract_filtered_html_allow_boilerplate(root: &Selection, options: &Options) -> String {
-    extract_filtered_html_inner(root, options, false)
+    extract_filtered_html_inner(root, options, false, None)
+}
+
+fn is_block_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "p" | "div"
+            | "section"
+            | "article"
+            | "main"
+            | "blockquote"
+            | "pre"
+            | "ul"
+            | "ol"
+            | "li"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "caption"
+            | "colgroup"
+            | "col"
+    ) || (tag.len() == 2 && tag.starts_with('h') && tag.as_bytes()[1].is_ascii_digit())
 }
 
 fn extract_filtered_html_inner(
     root: &Selection,
     options: &Options,
     filter_named_boilerplate: bool,
+    page_title: Option<&str>,
 ) -> String {
     let mut out = String::new();
     let tag = dom::tag_name(root).unwrap_or_default().to_ascii_lowercase();
     let inside_article_or_main = matches!(tag.as_str(), "article" | "main");
 
-    // Handle root-as-table: output <table> wrapper around children
-    if tag == "table" {
-        out.push_str("<table>");
-        push_filtered_html_children(
-            root,
-            &mut out,
-            inside_article_or_main,
-            false,
-            options,
-            filter_named_boilerplate,
-        );
-        out.push_str("</table>");
-    } else {
-        push_filtered_html_children(
-            root,
-            &mut out,
-            inside_article_or_main,
-            false,
-            options,
-            filter_named_boilerplate,
-        );
+    // Wrap root element in its tag when it's a meaningful block-level element.
+    // This preserves structural context (e.g., <pre>, <div>) that downstream
+    // consumers like quick_html2md rely on for markdown conversion.
+    let needs_wrap = is_block_tag(&tag);
+    if needs_wrap {
+        out.push('<');
+        out.push_str(&tag);
+        out.push('>');
+    }
+    push_filtered_html_children(
+        root,
+        &mut out,
+        inside_article_or_main,
+        false,
+        options,
+        filter_named_boilerplate,
+        page_title,
+    );
+    if needs_wrap {
+        out.push_str("</");
+        out.push_str(&tag);
+        out.push('>');
     }
     out.trim().to_string()
 }
@@ -2790,6 +2950,7 @@ fn push_filtered_html_children(
     inside_layout_table: bool,
     options: &Options,
     filter_named_boilerplate: bool,
+    page_title: Option<&str>,
 ) {
     let Some(root_node) = root.nodes().first() else {
         return;
@@ -2845,6 +3006,11 @@ fn push_filtered_html_children(
                 }
             }
 
+            // Shared content heuristics (link density, title dedup, share button patterns)
+            if should_skip_element_for_content(&tag, &el, options, page_title) {
+                continue;
+            }
+
             let next_inside_article_or_main = inside_article_or_main || matches!(tag.as_str(), "article" | "main");
 
             if inside_layout_table
@@ -2869,6 +3035,7 @@ fn push_filtered_html_children(
                     true,
                     options,
                     filter_named_boilerplate,
+                    page_title,
                 );
                 continue;
             }
@@ -2881,6 +3048,7 @@ fn push_filtered_html_children(
                     true,
                     options,
                     filter_named_boilerplate,
+                    page_title,
                 );
                 continue;
             }
@@ -2960,6 +3128,7 @@ fn push_filtered_html_children(
                     inside_layout_table,
                     options,
                     filter_named_boilerplate,
+                    page_title,
                 );
 
                 out.push_str("</");
@@ -2975,6 +3144,7 @@ fn push_filtered_html_children(
                     inside_layout_table,
                     options,
                     filter_named_boilerplate,
+                    page_title,
                 );
             }
         } else if child_node.is_text() {
