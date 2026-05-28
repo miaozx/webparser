@@ -568,6 +568,10 @@ fn contains_recomment(s: &str) -> bool {
 }
 
 fn matches_discard_class(s: &str) -> bool {
+    // Exact match for common short patterns (avoid false positives like "nav" matching "nav-wrap")
+    if s == "nav" || s == "menu" || s == "foot" || s == "head" || s == "side" || s == "login" || s == "search" || s == "footer" {
+        return true;
+    }
     let patterns = [
         "excellent_articles_box", "s-tip js-open-app", "photo-bar",
         "flex-content", "post-loop post-loop-list", "noLogin",
@@ -601,6 +605,7 @@ fn matches_discard_class(s: &str) -> bool {
         "js_qrcode_img js_share_qrcode", "copy-con",
         // Common C++ discard patterns (from discard_common_patterns, was dead code)
         "sidebar", "side", "menu", "navbar", "navbox",
+        "main-nav", "sub_nav", "global-nav", "nav-",
         "navigation", "subnav", "toolbar", "topbar",
         "rating", "tag-list", "tags", "categories",
         "byline", "dateline", "timestamp", "breadcrumb",
@@ -610,6 +615,7 @@ fn matches_discard_class(s: &str) -> bool {
         "interestlist", "hotsearch", "hotnews",
         "syndication", "user-info", "user-profile",
         "article-infos", "go_top", "feedback",
+        "sns-bar", "sharing", "share-button", "action-react",
     ];
     patterns.iter().any(|p| s.contains(p))
 }

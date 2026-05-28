@@ -189,21 +189,12 @@ fn extract_content_xml(
                 return Some((text, html));
             }
         } else {
-            // Parse the node HTML with dom_query for text extraction.
-            let dom_doc = DomDocument::from(node_html.as_str());
-            let body = dom_doc.select("body > *");
-            let text = if body.length() > 0 {
-                crate::extract::extract_filtered_text(&body, options)
-            } else {
-                doc.text_content(node_id).trim().to_string()
-            };
-            let html = if body.length() > 0 {
-                crate::extract::extract_filtered_html(&body, options)
-            } else {
-                node_html.to_string()
-            };
-            if text.len() >= 10 {
-                return Some((text, html));
+            // Use raw text content directly (avoids link-density filtering issues
+            // that can strip inline-linked content like baidu health answers).
+            let text = doc.text_content(node_id).trim().to_string();
+            let text_len = text.len();
+            if text_len >= 10 {
+                return Some((text, node_html.to_string()));
             }
         }
     }

@@ -3,6 +3,7 @@
 
 use rs_trafilatura::{extract_with_options, Options};
 use rs_trafilatura::page_type::PageType;
+use rs_trafilatura::xpath_config::XpathConfig;
 use serde::Serialize;
 use std::io::{self, Read};
 
@@ -87,12 +88,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Load xpath config from config/config.json
+    let xpath_config = (|| -> Option<rs_trafilatura::xpath_config::XpathConfig> {
+        let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.json");
+        let json = std::fs::read_to_string(config_path).ok()?;
+        rs_trafilatura::xpath_config::XpathConfig::from_json(&json).ok()
+    })();
+
     // Build options
     let options = Options {
         url,
         page_type: page_type_override,
         output_markdown: markdown,
         disable_title_anchored,
+        xpath_config,
         include_tables: if markdown { true } else { Options::default().include_tables },
         include_links: if markdown { true } else { Options::default().include_links },
         include_formatting: if markdown { true } else { Options::default().include_formatting },

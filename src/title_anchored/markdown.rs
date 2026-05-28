@@ -19,7 +19,13 @@ pub struct TAExtractResult {
 }
 
 pub fn extract_with_ta(html: &str) -> Option<TAExtractResult> {
-    let doc = xmloxide::html5::parse_html5(html).ok()?;
+    let doc = match xmloxide::html5::parse_html5(html) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DEBUG_PARSE_ERR: {}", e);
+            return None;
+        }
+    };
     extract_from_doc(&doc)
 }
 
@@ -224,80 +230,56 @@ fn find_content_node_xml(doc: &xmloxide::Document, features: &FeatureTree,
         for child in doc.children(node) {
             if !doc.is_element(child) { continue; }
 
-            // Check if this IS the title node
             if child == title_node {
                 *match_node = true;
-                continue;  // Skip the title itself, check next sibling
+                continue;
             }
 
-            // Before match: skip all elements (C++: (time_node || title_node) && !match_node)
             if !*match_node {
-                // C++: still recurse into children to look for title deeper
                 if let Some(result) = locate(doc, features, child, title_node, body_feat, match_node) {
                     return Some(result);
                 }
                 continue;
             }
 
-            // After match: check if this is a content node
             let tag = doc.node_name(child).unwrap_or("").to_lowercase();
-
-            // Skip filtered tags (C++: script/style/link/table/noscript/a/footer/invisible/filter)
-            if matches!(tag.as_str(), "script" | "style" | "link" | "noscript" | "a" | "footer") {
+            if matches!(tag.as_str(), "script" | "style" | "link" | "noscript" | "a" | "footer" | "textarea") {
                 continue;
             }
             if !super::feature::is_visible_node(child, doc) { continue; }
             if features.is_filter_node(child, doc) { continue; }
 
-            // Debug: print features for every candidate
             if let Some(feat) = features.get(child) {
+                let denom = (body_feat.exclude_a_text_len + 1) as f64;
+                let hit_attr = super::feature::hit_content_attribute(child, doc);
+                let ratio = feat.exclude_a_text_len as f64 / denom;
+
                 eprintln!("DEBUG_CN: tag={} class={:?} match={} text_len={} exclude={} body_ex={} ratio={:.4} hit_attr={}",
                     tag, doc.attribute(child, "class").unwrap_or(""),
                     *match_node, feat.text_len, feat.exclude_a_text_len,
-                    body_feat.exclude_a_text_len,
-                    if body_feat.exclude_a_text_len > 0 { feat.exclude_a_text_len as f64 / body_feat.exclude_a_text_len as f64 } else { 0.0 },
-                    super::feature::hit_content_attribute(child, doc));
-            }
+                    body_feat.exclude_a_text_len, ratio, hit_attr);
 
-            // C++ IsContentNode check
-            if let Some(feat) = features.get(child) {
-                let denom = (body_feat.exclude_a_text_len + 1) as f64;
-                // C++: text_len > 64 && HitContentAttribute && exclude/(body_exclude+1) > 0.35
-                if feat.text_len > 64
-                    && super::feature::hit_content_attribute(child, doc)
-                    && (feat.exclude_a_text_len as f64 / denom) > 0.35
-                {
-                    // C++: try GetNextContentNode unwrapping, then return
+                // C++: text_len > 64 && HitContentAttribute && ratio > 0.35
+                if feat.text_len > 64 && hit_attr && ratio > 0.35 {
                     let inner = super::content::get_next_content_node(doc, child);
                     if let Some(inner_id) = inner {
                         if features.is_content_node(inner_id, doc, body_feat.exclude_a_text_len, true) {
-                            if let Some(p) = doc.parent(inner_id) {
-                                return Some(p);
-                            }
+                            if let Some(p) = doc.parent(inner_id) { return Some(p); }
                         }
                     }
                     return Some(child);
                 }
                 // C++ negative checks
-                if *match_node && feat.has_recomment_title && feat.tag_a_nc > 3 && feat.click_image_count > 3 {
-                    continue;
-                }
-                if *match_node && feat.tag_a_nc > 30 && feat.click_image_count > 3 {
-                    continue;
-                }
-                if (tag == "ul" || tag == "ol") && feat.tag_a_nc > 100 {
-                    continue;
-                }
-                if feat.tag_a_nc >= 101 && feat.max_exclude_a_text_len < 20.0 {
-                    continue;
-                }
+                if *match_node && feat.has_recomment_title && feat.tag_a_nc > 3 && feat.click_image_count > 3 { continue; }
+                if *match_node && feat.tag_a_nc > 30 && feat.click_image_count > 3 { continue; }
+                if (tag == "ul" || tag == "ol") && feat.tag_a_nc > 100 { continue; }
+                if feat.tag_a_nc >= 101 && feat.max_exclude_a_text_len < 20.0 { continue; }
                 // C++: match_node && exclude/(body_exclude+1) > 0.6
-                if *match_node && (feat.exclude_a_text_len as f64 / denom) > 0.6 {
+                if *match_node && ratio > 0.6 {
                     return Some(child);
                 }
             }
 
-            // Recurse into children (C++: LocateContentNode(child, ...))
             if let Some(result) = locate(doc, features, child, title_node, body_feat, match_node) {
                 return Some(result);
             }
@@ -491,7 +473,11 @@ fn traverse_content(
                         }
                     }
                     // C++: IsEndText(node_content) && text_len_ > 256 && node_content.length() < 64
-                    if is_end_text(trimmed) && text_len_ > 256 && trimmed.len() < 64 {
+                    // C++ IsEndText: stop when end signal found and we have enough content,
+                    // OR when the end signal IS the first content (no accumulated text yet)
+                    if is_end_text(trimmed) && trimmed.len() < 20
+                        && (text_len_ > 256 || cur_text.is_empty())
+                    {
                         *is_end = true;
                     } else {
                         cur_text.push_str(&node_content);
@@ -511,6 +497,16 @@ fn traverse_content(
     if matches!(tag.as_str(), "script" | "style" | "link" | "noscript"
         | "form" | "select" | "option" | "video" | "svg")
     {
+        continue;
+    }
+    // textarea: extract text content by stripping HTML tags (raw HTML inside)
+    if tag == "textarea" {
+        let raw = doc.text_content(child);
+        let stripped = strip_html_tags(&raw).trim().to_string();
+        if !stripped.is_empty() {
+            if !cur_text.is_empty() { cur_text.push('\n'); }
+            cur_text.push_str(&stripped);
+        }
         continue;
     }
 
@@ -534,7 +530,9 @@ fn traverse_content(
             }
             // Check if cur_text ends with end signal (for text that happens at paragraph level)
             let trimmed_text = cur_text.trim();
-            if text_len_ > 256 && is_end_text(trimmed_text) {
+            if trimmed_text.len() < 20 && is_end_text(trimmed_text)
+                && (text_len_ > 256 || cur_text.is_empty())
+            {
                 *is_end = true;
                 break;
             }
@@ -542,7 +540,7 @@ fn traverse_content(
             if NEWLINE_TAGS.contains(&tag.as_str()) {
                 let raw = cur_text.trim().to_string();
                 if !raw.is_empty() {
-                    let is_end_signal = is_end_text(raw.trim()) && text_len_ > 256;
+                    let is_end_signal = is_end_text(raw.trim()) && text_len_ > 256 && raw.trim().len() < 20;
                     if *in_code_tag { para_list.push(raw); }
                     else { let fp = format_paragraph(&raw); if !fp.is_empty() { para_list.push(fp); } }
                     if is_end_signal {
@@ -926,6 +924,53 @@ fn markdown_to_text(md: &str) -> String {
         }
     }
     out
+}
+
+/// Strip HTML tags from a string (e.g. textarea content).
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    let mut in_entity = false;
+    let mut entity = String::new();
+    for c in s.chars() {
+        if in_tag {
+            if c == '>' { in_tag = false; }
+            continue;
+        }
+        if c == '<' { in_tag = true; continue; }
+        if c == '&' { in_entity = true; entity.clear(); continue; }
+        if in_entity {
+            if c == ';' {
+                // decode common entities
+                let decoded = match entity.as_str() {
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "nbsp" | "#160" => " ",
+                    "quot" => "\"",
+                    _ => "",
+                };
+                out.push_str(decoded);
+                in_entity = false;
+            } else {
+                entity.push(c);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    // Collapse whitespace
+    let mut prev_space = false;
+    let collapsed: String = out.chars().filter(|&c| {
+        if c.is_whitespace() && (c == ' ' || c == '\n') {
+            if prev_space { return false; }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        true
+    }).collect();
+    collapsed
 }
 
 fn check_para_list(para_list: Vec<String>) -> Vec<String> {

@@ -247,7 +247,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
     // Try title-anchored extraction as an independent alternative strategy.
     // TA outputs its own markdown + text, not modified by downstream pipeline.
     // TA: self-contained markdown+text output, no downstream modification allowed.
-    // Uses the same xmloxide Document (original HTML) as xpath — no separate parse.
+    // Uses shared xmloxide Document (same as xpath) to avoid re-parsing.
     let mut ta_markdown: Option<String> = None;
     if !xpath_extracted && !options.disable_title_anchored {
         use crate::title_anchored::extract_from_doc;
