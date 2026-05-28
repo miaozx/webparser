@@ -233,6 +233,16 @@ pub struct Options {
     ///
     /// Default: `None`
     pub page_type: Option<crate::page_type::PageType>,
+
+    /// XPath configuration for URL-matched content extraction.
+    ///
+    /// When set, the URL is matched against xpath rules before the standard
+    /// extraction pipeline. If a rule matches and produces content, the
+    /// xpath-extracted content is used directly. If no rule matches or no
+    /// content is found, the standard pipeline runs as fallback.
+    ///
+    /// Default: `None`
+    pub xpath_config: Option<crate::xpath_config::XpathConfig>,
 }
 
 impl Default for Options {
@@ -269,6 +279,7 @@ impl Default for Options {
             output_markdown: false,
             disable_title_anchored: false,
             page_type: None,
+            xpath_config: None,
         }
     }
 }

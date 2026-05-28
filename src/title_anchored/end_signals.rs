@@ -1,5 +1,3 @@
-use crate::dom::Selection;
-
 const END_PATTERNS: &[&str] = &[
     "声明",
     "免责声明",
@@ -9,6 +7,8 @@ const END_PATTERNS: &[&str] = &[
     "责任编辑",
     "关键词",
     "相关文章",
+    "相关阅读",
+    "更多精彩内容",
     "本文由",
     "来源",
     "阅读更多",
@@ -83,8 +83,6 @@ const END_PATTERNS: &[&str] = &[
     "推荐商品",
 ];
 
-/// Negative anchor text patterns — if a link's text matches, the surrounding
-/// node has high link density from non-content links.
 const NEGATIVE_ANCHOR_PATTERNS: &[&str] = &[
     "上一篇",
     "下一篇",
@@ -146,6 +144,7 @@ const NEGATIVE_ANCHOR_PATTERNS: &[&str] = &[
     "合作伙伴",
     "广告",
     "广告合作",
+    "Related News"
 ];
 
 pub fn has_end_signal(text: &str) -> bool {
@@ -161,6 +160,49 @@ pub fn has_end_signal(text: &str) -> bool {
     false
 }
 
+/// C++ IsEndText: comprehensive end signal detection for article content.
+/// Matches by substring (contains) so it covers more cases than exact match.
+pub fn is_end_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Exact matches from C++ IsEndText
+    let exact_patterns = [
+        "上一页", "下一页", "延伸閱讀", "推荐帖", "相关主题：",
+        "【扩展阅读】", "-END-", "上一章", "关联文章推荐",
+        "更多精彩内容", "更多相关榜单", "下一章", "上一集",
+        "下一集", "相关推荐", "编辑推荐：", "相關文章",
+        "更多相关百科知识", "相关文章", "延伸阅读", "最新文章",
+        "网友评论", "相关问答", "为你推荐", "相关新闻",
+        "推荐阅读", "活动推荐", "为您推荐", "猜你喜欢",
+        "热门游戏", "近期文章", "相关问题", "大家都在看",
+        "精彩推荐", "大家在看", "免责声明", "相关软件",
+        "相关阅读", "上一篇", "下一篇",
+    ];
+    if exact_patterns.contains(&t) {
+        return true;
+    }
+
+    // Substring patterns from C++ IsEndText
+    let substring_patterns = [
+        "相关文章：", "往期推荐:", "上一篇：", "上一篇:", "下一篇：", "下一篇:",
+        "上一篇 >", "下一篇 >", "«上一页", "←上一章",
+        "-相关推荐-", "版权和免责声明", "版权说明：", "版权声明：",
+        "免责声明：", "网友评论：", "--免责声明--", "相关内容：",
+        "猜你喜欢：", "我的更多文章：", "相关文档推荐", "更多相关文章",
+        "您还感兴趣的文章推荐", "看过这篇文章的人还喜欢",
+        "【推荐阅读】", "相关阅读：", "相关阅读:", "推荐阅读：",
+    ];
+    for pat in &substring_patterns {
+        if t.contains(pat) {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn contains_negative_anchor_text(text: &str) -> bool {
     let text = text.trim().to_lowercase();
     for pattern in NEGATIVE_ANCHOR_PATTERNS {
@@ -169,28 +211,4 @@ pub fn contains_negative_anchor_text(text: &str) -> bool {
         }
     }
     false
-}
-
-pub fn is_high_link_density(el: &Selection) -> bool {
-    let total_text = el.text();
-    let total_len = total_text.trim().len();
-    if total_len < 50 {
-        return false;
-    }
-    let mut link_text_len = 0usize;
-    for node in el.select("a").nodes() {
-        let sel = crate::dom::Selection::from(*node);
-        let link_text = sel.text();
-        let t = link_text.trim();
-        for pattern in NEGATIVE_ANCHOR_PATTERNS {
-            if t.contains(pattern) {
-                link_text_len += t.len();
-                break;
-            }
-        }
-    }
-    if total_len == 0 {
-        return false;
-    }
-    link_text_len as f64 / total_len as f64 > 0.5
 }

@@ -109,6 +109,88 @@ pub fn extract_discourse_content(doc: &Document) -> Option<String> {
     Some(content_parts.join("\n\n"))
 }
 
+/// Extract post content from Lemmy forum pages (`window.isoData`).
+///
+/// Lemmy is a federated Reddit-like platform that embeds post content in
+/// a `window.isoData` JSON object within a `<script>` tag. The main DOM
+/// only contains a short preview of the post. This function extracts the
+/// full post body from the JSON data.
+///
+/// Returns the post body as decoded HTML.
+#[must_use]
+pub fn extract_lemmy_content(doc: &Document) -> Option<String> {
+    // Find script tags that contain window.isoData
+    for script_node in doc.select("script").nodes() {
+        let script = Selection::from(*script_node);
+        let text = script.text();
+        let text = text.trim();
+
+        if !text.contains("window.isoData") {
+            continue;
+        }
+
+        // Directly find the post_view.post.content field value using string search.
+        // Avoids parsing the entire isoData JSON (can be 200K+ chars).
+        let content_key = "\"content\":\"";
+        let pv_key = "\"post_view\"";
+
+        let pv_pos = match text.find(pv_key) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let search_from = pv_pos + pv_key.len();
+        let remaining = &text[search_from..];
+
+        let content_pos = match remaining.find(content_key) {
+            Some(p) => search_from + p,
+            None => continue,
+        };
+
+        let value_start = content_pos + content_key.len();
+
+        let mut content = String::new();
+        let chars: Vec<char> = text[value_start..].chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' {
+                if i + 1 < chars.len() {
+                    content.push(chars[i]);
+                    content.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    content.push(chars[i]);
+                    i += 1;
+                }
+            } else if chars[i] == '"' {
+                break;
+            } else {
+                content.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        if content.is_empty() {
+            continue;
+        }
+
+        // Unescape common escape sequences
+        let unescaped = content
+            .replace("\\u003c", "<")
+            .replace("\\u003e", ">")
+            .replace("\\u0026", "&")
+            .replace("\\n", "\n")
+            .replace("\\\"", "\"");
+
+        let cleaned = unescaped.trim().to_string();
+        if cleaned.len() > 100 {
+            return Some(cleaned);
+        }
+    }
+
+    None
+}
+
 /// Recursively find articleBody in JSON-LD data.
 fn find_article_body(value: &Value) -> Option<String> {
     match value {

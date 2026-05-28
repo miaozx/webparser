@@ -31,13 +31,20 @@ thread_local! {
 use crate::selector;
 use crate::result::{ExtractResult, ImageData};
 use crate::url_utils::{extract_filename, filenames_match};
+use crate::xpath_parser;
 
 /// Main entry point for content extraction.
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractResult> {
+pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<ExtractResult> {
     if cfg!(debug_assertions) {
-        eprintln!("DEBUG: Starting content extraction (HTML length: {} chars)", html.len());
+        eprintln!("DEBUG: Starting content extraction (HTML length: {} chars)", html_input.len());
     }
+
+    // Pre-process HTML for special sites that embed content in non-HTML formats
+    // (e.g., JavaScript state objects, JSON inside textareas, broken markup).
+    // Returns clean synthetic HTML for the standard extraction pipeline.
+    let preprocessed = preprocess_for_site(html_input, options);
+    let html: &str = preprocessed.as_deref().unwrap_or(html_input);
 
     // Parse HTML document
     let document = Document::from(html);
@@ -132,6 +139,14 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
     let discourse_body = fallback::extract_discourse_content(&document);
     let use_discourse = discourse_body.as_ref().is_some_and(|body| body.chars().count() >= MIN_STRUCTURED_BODY_LEN);
 
+    // Fix 11: Try Lemmy forum extraction (window.isoData JSON)
+    // Lemmy embeds post content in a JSON object within a <script> tag.
+    // Use a lower threshold (200) since Lemmy posts are often shorter
+    // than full articles, but still the intended content.
+    const MIN_LEMMY_BODY_LEN: usize = 200;
+    let lemmy_body = fallback::extract_lemmy_content(&document);
+    let use_lemmy = lemmy_body.as_ref().is_some_and(|body| body.chars().count() >= MIN_LEMMY_BODY_LEN);
+
     // Get extraction profile for detected page type
     let profile = detected_page_type.extraction_profile();
 
@@ -156,81 +171,122 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
 
     // Find and extract main content (graceful degradation on failure)
     // If we have substantial JSON-LD content, still run DOM extraction but compare results
-    let page_title = metadata.title.as_deref();
-    let (mut content_text, mut content_html) = match extract_main_content_with_profile(&document, options, page_title, profile.content_selectors) {
-        Ok((text, html)) => (text, html),
-        Err(Error::NoContent) => {
-            warnings.push("Content extraction failed - no main content found".to_string());
-            (String::new(), None)
-        }
-        Err(e) => {
-            warnings.push(format!("Content extraction failed: {e}"));
-            (String::new(), None)
-        }
-    };
 
-    // Try title-anchored extraction as an independent alternative strategy.
-    // Compares normal extraction with title-anchored result:
-    // - If length ratio > 0.95, pick the shorter result (more concise)
-    // - Otherwise, pick the longer result (more content)
-    if !options.disable_title_anchored {
-        use crate::title_anchored::{FeatureTree, find_content_by_anchor, locate_title_node, parse_head_title};
+    // Parse original HTML once with xmloxide, shared between xpath and title_anchored.
+    let xml_doc = xmloxide::html5::parse_html5(html).ok();
 
-        let head_title = parse_head_title(&doc_backup);
-        let features = FeatureTree::build(&document);
-        if let Some(ref head_title) = head_title {
-            if let Some(title_node) = locate_title_node(&document, &head_title, Some(&features)) {
-                if let Some(ta_node) = find_content_by_anchor(&document, &features, &title_node) {
-                        let ta_text = extract_filtered_text_with_title(&ta_node, options, page_title);
-                        let ta_html = extract_filtered_html_with_title(&ta_node, options, page_title);
-                        let ta_len = ta_text.chars().count();
-                        let normal_len = content_text.chars().count();
-
-                    if ta_len > 0 && normal_len > 0 {
-                        let (shorter, longer) = if ta_len < normal_len {
-                            (ta_len, normal_len)
-                        } else {
-                            (normal_len, ta_len)
-                        };
-                        let ratio = shorter as f64 / longer as f64;
-                        let use_ta = if ratio > 0.95 {
-                            ta_len < normal_len
-                        } else {
-                            ta_len > normal_len
-                        };
-                        if use_ta {
-                            content_text = ta_text;
-                            content_html = Some(ta_html);
+    // Try xpath-based content extraction first if xpath config is available.
+    // Xpath extraction takes priority: if the URL matches a config rule
+    // and content >= 128 chars is found, it replaces the standard extraction
+    // pipeline entirely (no fallback, no title-anchored, etc.).
+    // If xpath fails or produces < 128 chars, we fall through.
+    let mut xpath_content: Option<xpath_parser::XpathParseResult> = None;
+    if let Some(ref xpath_config) = options.xpath_config {
+        if let Some(url) = options.url.as_deref() {
+            if let Some(fields) = xpath_config.match_url(url) {
+                if cfg!(debug_assertions) {
+                    eprintln!("DEBUG: Xpath config matched URL, trying xpath extraction");
+                }
+                let result = xml_doc.as_ref().and_then(|xd| {
+                    xpath_parser::parse_with_xpath_doc(xd, url, &fields, options)
+                });
+                if let Some(result) = result {
+                    let content_len = result.content_text.len();
+                    if content_len >= 128 {
+                        if cfg!(debug_assertions) {
+                            eprintln!("DEBUG: Xpath extraction succeeded: {content_len} chars (>=128, keeping)");
                         }
-                    } else if ta_len > 0 {
-                        content_text = ta_text;
-                        content_html = Some(ta_html);
+                        warnings.push(format!("Used xpath-based content extraction ({content_len} chars)"));
+                        // Override metadata from xpath fields
+                        if let Some(title) = &result.title {
+                            metadata.title = Some(title.clone());
+                        }
+                        if let Some(date_str) = &result.publish_time {
+                            let parsed_date = try_parse_xpath_date(date_str);
+                            if parsed_date.is_some() {
+                                metadata.date = parsed_date;
+                            }
+                        }
+                        if let Some(author) = &result.author {
+                            metadata.author = Some(author.clone());
+                        }
+                        if let Some(desc) = &result.description {
+                            metadata.description = Some(desc.clone());
+                        }
+                        xpath_content = Some(result);
+                    } else if cfg!(debug_assertions) {
+                        eprintln!("DEBUG: Xpath extraction only got {content_len} chars (<128, falling through)");
                     }
-                    if ta_len > 0 {
-                        TA_USED.with(|c| c.set(true));
-                    }
+                } else if cfg!(debug_assertions) {
+                    eprintln!("DEBUG: Xpath extraction produced no content, falling through");
                 }
             }
         }
     }
 
+    let page_title = metadata.title.as_deref();
+    let xpath_extracted: bool;
+    let (mut content_text, mut content_html) = if let Some(xpath_result) = xpath_content {
+        xpath_extracted = true;
+        (xpath_result.content_text, Some(xpath_result.content_html))
+    } else {
+        xpath_extracted = false;
+        match extract_main_content_with_profile(&document, options, page_title, profile.content_selectors) {
+            Ok((text, html)) => (text, html),
+            Err(Error::NoContent) => {
+                warnings.push("Content extraction failed - no main content found".to_string());
+                (String::new(), None)
+            }
+            Err(e) => {
+                warnings.push(format!("Content extraction failed: {e}"));
+                (String::new(), None)
+            }
+        }
+    };
+
+    // Try title-anchored extraction as an independent alternative strategy.
+    // TA outputs its own markdown + text, not modified by downstream pipeline.
+    // TA: self-contained markdown+text output, no downstream modification allowed.
+    // Uses the same xmloxide Document (original HTML) as xpath — no separate parse.
+    let mut ta_markdown: Option<String> = None;
+    if !xpath_extracted && !options.disable_title_anchored {
+        use crate::title_anchored::extract_from_doc;
+
+        if let Some(ref xml_doc) = xml_doc {
+        if let Some(ta_result) = extract_from_doc(xml_doc) {
+            let ta_text = ta_result.content_text;
+            let ta_md = ta_result.content_markdown;
+            let ta_len = ta_text.chars().count();
+
+            if metadata.title.is_none() && !ta_result.title.is_empty() {
+                metadata.title = Some(ta_result.title.clone());
+            }
+            if metadata.date.is_none() && !ta_result.publish_time.is_empty() {
+                if let Ok(dt) = chrono::NaiveDate::parse_from_str(&ta_result.publish_time, "%Y-%m-%d") {
+                    metadata.date = Some(dt.and_hms_opt(0, 0, 0).unwrap().and_utc());
+                }
+            }
+
+            TA_USED.with(|c| c.set(true));
+            if ta_len > 0 {
+                ta_markdown = Some(ta_md.clone());
+                content_text = ta_md;
+                content_html = Some(format!("<div>{}</div>", ta_text.replace('\n', "<br>")));
+            }
+        }
+        }
+    }
+
+    // If xpath or TA produced content, skip all downstream modifications (fallback, structured data, etc.)
+    if !xpath_extracted && ta_markdown.is_none() {
     // Try fallback extraction when main extraction may be insufficient
-    // Only trigger when content is potentially under-extracted, following original RS logic.
-    // Go-trafilatura always calls fallback but has different main extraction results.
-    // We use conditional triggering + candidateIsUsable for better precision.
+    // ... (rest of the downsteam pipeline) ...
+
     let content_len = content_text.chars().count();
     let min_extracted_len = options.min_extracted_len;
     let word_count = count_words(&content_text, options.min_word_length);
 
-    // Detect potential under-extraction: no paragraphs or table-heavy content
-    // suggests wrong content was selected (e.g., footer, navigation, data table).
-    // Only consider under-extracted when text is also short — if text is long
-    // but HTML has no <p> tags (e.g., content inside <pre> or link-dense gallery,
-    // Korean/Chinese content inside <td><span><font>), the text is still valid
-    // and shouldn't trigger fallback.
     let mut under_extracted = if content_len > 500 {
-        // Content is substantial — don't flag as under-extracted even if
-        // no <p> tags (content may be in table cells, spans, etc.)
         false
     } else if let Some(ref html) = content_html {
         let doc = Document::from(html.as_str());
@@ -241,34 +297,20 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
         true
     };
 
-    // Also check word count - navigation/footer often has few words but many chars
-    // (e.g., "Home | About | Contact" passes char check but has low word count)
     let insufficient_words = word_count < options.min_output_size;
 
-    // Detect navigation-like content: starts with common nav links or has repeated text
-    // Navigation often starts with "Home About Contact..." pattern
     let looks_like_navigation = {
         let lower = content_text.to_lowercase();
-        // Get first ~100 chars safely (on char boundary)
         let first_100: String = lower.chars().take(100).collect();
-        // Count navigation keywords in first 100 chars
         let nav_keywords = ["home", "about", "contact", "links", "menu", "search", "login"];
         let nav_count = nav_keywords.iter().filter(|k| first_100.contains(*k)).count();
-        nav_count >= 3 // 3+ nav keywords at start suggests wrong content
+        nav_count >= 3
     };
 
     if options.use_fallback_extraction && (content_len < min_extracted_len || under_extracted || insufficient_words || looks_like_navigation) {
-        // Use doc_backup (pre-cleaning) for fallback - critical for pages where
-        // content is inside <form> tags that get removed by doc_cleaning
-        // Pass content_html for proper structural comparison in candidate_is_usable
         let (fallback_text, fallback_html) =
             try_fallback_extraction(&doc_backup, &content_text, content_html.as_deref(), options);
 
-        // try_fallback_extraction uses candidate_is_usable heuristics internally:
-        // - Won't accept candidates that shrink content by >50% (protects good extractions)
-        // - Will accept candidates that are 2x+ larger (significant improvement)
-        // - Uses structural analysis for borderline cases (p text, tables vs paragraphs)
-        // If it returns Some(html), the result has been validated as an improvement
         if let Some(ref html) = fallback_html {
             let fallback_len = fallback_text.chars().count();
             warnings.push(format!(
@@ -278,6 +320,7 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
             content_html = Some(html.clone());
         }
     }
+    } // end if !xpath_extracted && ta_markdown.is_none()
 
     // Step 7: Multi-candidate merge for service pages.
     // When single-node extraction captures only one section of a multi-section page,
@@ -372,16 +415,24 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
         }
     }
 
-    // Fix 9 & 10: Prefer structured data (JSON-LD or Discourse) when substantially better
-    // Compare structured content with DOM extraction result
-    let structured_body = if use_discourse {
+    // Fix 9, 10 & 11: Prefer structured data (JSON-LD, Discourse, or Lemmy)
+    // when substantially better than DOM extraction.
+    let structured_body = if use_lemmy {
+        lemmy_body.as_ref()
+    } else if use_discourse {
         discourse_body.as_ref()
     } else if use_json_ld {
         json_ld_body.as_ref()
     } else {
         None
     };
-    let structured_source = if use_discourse { "Discourse" } else { "JSON-LD" };
+    let structured_source = if use_lemmy {
+        "Lemmy"
+    } else if use_discourse {
+        "Discourse"
+    } else {
+        "JSON-LD"
+    };
 
     if let Some(structured_text) = structured_body {
         let structured_len = structured_text.chars().count();
@@ -391,8 +442,11 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
         // 1. DOM extraction failed or is very short (<200 chars)
         // 2. Structured data is at least 2x larger than DOM extraction
         // 3. DOM extraction looks like navigation/boilerplate (low word ratio)
+        // 4. Structured data is Lemmy content (forum post) — always prefer
+        //    it since the DOM only has a short excerpt on Lemmy pages.
         let dom_failed = dom_len < 200;
         let structured_much_larger = structured_len > dom_len * 2;
+        let use_lemmy_content = use_lemmy && structured_len > 0;
         let dom_looks_like_boilerplate = {
             let lower = content_text.to_lowercase();
             let first_200: String = lower.chars().take(200).collect();
@@ -402,12 +456,19 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
                 || (first_200.matches('\n').count() > first_200.split_whitespace().count() / 3)
         };
 
-        if dom_failed || structured_much_larger || dom_looks_like_boilerplate {
+        if dom_failed || structured_much_larger || dom_looks_like_boilerplate || use_lemmy_content {
             warnings.push(format!(
                 "Using {structured_source} content: {structured_len} chars (DOM was {dom_len} chars)"
             ));
 
-            if use_discourse {
+            if use_lemmy {
+                // Lemmy content is decoded HTML — keep tags for markdown conversion.
+                let html_body = format!("<div>{structured_text}</div>");
+                let temp_doc = Document::from(html_body.as_str());
+                let temp_root = temp_doc.select("div");
+                content_text = crate::dom::text_content(&temp_root).trim().to_string();
+                content_html = Some(structured_text.clone());
+            } else if use_discourse {
                 // Discourse content is decoded HTML — keep tags for markdown conversion
                 let html_body = format!("<div>{structured_text}</div>");
                 let temp_doc = Document::from(html_body.as_str());
@@ -529,8 +590,18 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
             }
             markdown = cleaned_lines.join("\n");
 
+            // Collapse multiple blank lines: at most one blank line between paragraphs.
+            let re = regex::Regex::new(r"\n{3,}").expect("valid regex");
+            markdown = re.replace_all(&markdown, "\n\n").to_string();
+
             result.content_markdown = Some(markdown);
         }
+    }
+
+    // When TA was used, use its own markdown (not quick_html2md)
+    if let Some(ref ta_md) = ta_markdown {
+        result.content_markdown = Some(ta_md.clone());
+        result.content_text = ta_md.clone();
     }
 
     // Apply final validations and return
@@ -546,6 +617,26 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
     }
 
     final_result
+}
+
+/// Pre-process HTML for special sites before standard extraction.
+///
+/// Some sites (36kr, Baidu Hanyu, Gov.cn) embed content in non-HTML formats
+/// like JavaScript state variables or JSON within textareas, or have broken
+/// HTML structure. This function transforms these into clean HTML that the
+/// standard extraction pipeline can process normally.
+fn preprocess_for_site(html: &str, options: &Options) -> Option<String> {
+    let url = options.url.as_ref()?;
+
+    if crate::preprocessor::is_36kr_url(url) {
+        crate::preprocessor::extract_36kr_content(html)
+    } else if crate::preprocessor::is_baidu_hanyu_url(url) {
+        crate::preprocessor::extract_baidu_hanyu_content(html)
+    } else if crate::preprocessor::is_gov_cn_url(url) {
+        crate::preprocessor::preprocess_gov_cn_html(html)
+    } else {
+        None
+    }
 }
 
 /// Counts words in text that meet minimum length requirement.
@@ -1103,6 +1194,45 @@ fn count_words(text: &str, min_length: usize) -> usize {
             .filter(|w| w.len() >= min_length)
             .count()
     }
+}
+
+/// Try to parse a date string returned by xpath extraction.
+/// Supports ISO 8601, RFC 3339, and common web date formats.
+fn try_parse_xpath_date(date_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = date_str.trim();
+
+    // RFC 3339 / ISO 8601 (with timezone): 2024-01-15T10:30:00Z or +00:00
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+
+    // ISO 8601 without timezone: 2024-01-15T10:30:00
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(dt.and_utc());
+    }
+
+    // ISO 8601 date only: 2024-01-15
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+
+    // Common web formats
+    // "Mon, 15 Jan 2024 10:30:00 GMT" (RFC 2822)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+
+    // "2024/01/15" or "2024/01/15 10:30:00"
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y/%m/%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+
+    // Chinese date format: "2024年01月15日"
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y年%m月%d日") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+
+    None
 }
 
 /// Attempts fallback extraction when main extraction produces insufficient content.
@@ -2508,7 +2638,7 @@ fn extract_body_content_html(doc: &Document, options: &Options) -> Result<String
     Ok(extract_filtered_html(&body, options))
 }
 
-fn extract_filtered_text(root: &Selection, options: &Options) -> String {
+pub(crate) fn extract_filtered_text(root: &Selection, options: &Options) -> String {
     extract_filtered_text_inner(root, options, true, None)
 }
 
@@ -2975,7 +3105,7 @@ fn extract_filtered_text_inner(
     normalize_text_output(&out)
 }
 
-fn extract_filtered_html(root: &Selection, options: &Options) -> String {
+pub(crate) fn extract_filtered_html(root: &Selection, options: &Options) -> String {
     extract_filtered_html_inner(root, options, true, None)
 }
 
@@ -4689,6 +4819,43 @@ mod tests {
             }
             Err(err) => panic!("expected Ok(_), got Err({err:?})"),
         }
+    }
+}
+
+/// Serialize an xmloxide node subtree to HTML string.
+fn serialize_xml_node(doc: &xmloxide::Document, id: xmloxide::NodeId) -> String {
+    let mut out = String::new();
+    serialize_xml_node_inner(doc, id, &mut out);
+    // Wrap in a minimal structure for dom_query parsing
+    if out.trim().is_empty() {
+        return String::new();
+    }
+    format!("<html><body>{}</body></html>", out)
+}
+
+fn serialize_xml_node_inner(doc: &xmloxide::Document, id: xmloxide::NodeId, out: &mut String) {
+    if doc.is_element(id) {
+        if let Some(name) = doc.node_name(id) {
+            out.push('<');
+            out.push_str(name);
+            for attr in doc.attributes(id) {
+                let val = attr.value.replace('"', "&quot;");
+                out.push(' ');
+                out.push_str(&attr.name);
+                out.push_str("=\"");
+                out.push_str(&val);
+                out.push('"');
+            }
+            out.push('>');
+            for child in doc.children(id) {
+                serialize_xml_node_inner(doc, child, out);
+            }
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+        }
+    } else if let Some(text) = doc.node_text(id) {
+        out.push_str(text);
     }
 }
 

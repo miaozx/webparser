@@ -72,12 +72,15 @@ pub(crate) mod dom;
 pub(crate) mod etree;
 pub(crate) mod lru;
 pub(crate) mod selector;
+pub(crate) mod preprocessor;
 pub(crate) mod html_processing;
 pub(crate) mod extractor;
 pub(crate) mod metadata;
 pub(crate) mod url_utils;
 pub(crate) mod link_density;
 pub mod title_anchored;
+pub mod xpath_config;
+pub(crate) mod xpath_parser;
 
 // Public API - re-exports
 pub use error::{Error, Result};
