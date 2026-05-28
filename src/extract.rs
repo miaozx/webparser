@@ -36,9 +36,9 @@ use crate::xpath_parser;
 /// Main entry point for content extraction.
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<ExtractResult> {
-    if cfg!(debug_assertions) {
-        eprintln!("DEBUG: Starting content extraction (HTML length: {} chars)", html_input.len());
-    }
+    let url_log = options.url.as_deref().unwrap_or("unknown");
+    let html_len = html_input.len();
+    tracing::info!(target: "extract", "start url={url_log} html_size={html_len}");
 
     // Pre-process HTML for special sites that embed content in non-HTML formats
     // (e.g., JavaScript state objects, JSON inside textareas, broken markup).
@@ -46,8 +46,10 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
     let preprocessed = preprocess_for_site(html_input, options);
     let html: &str = preprocessed.as_deref().unwrap_or(html_input);
 
+
     // Parse HTML document
     let document = Document::from(html);
+
 
     let mut warnings = Vec::new();
 
@@ -98,6 +100,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
             (ml_type, Some(ml_conf))
         }
     };
+
 
     // Store detected page type in metadata
     metadata.page_type = Some(detected_page_type.as_str().to_string());
@@ -165,15 +168,18 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         COMMENTS_ARE_CONTENT.with(|c| c.set(true));
     }
 
+
     // Clean document before content extraction (go-trafilatura: docCleaning)
     // Uses page-type-specific boilerplate selectors and preserve_tags.
     html_processing::doc_cleaning_with_profile(&document, options, &profile);
+
 
     // Find and extract main content (graceful degradation on failure)
     // If we have substantial JSON-LD content, still run DOM extraction but compare results
 
     // Parse original HTML once with xmloxide, shared between xpath and title_anchored.
     let xml_doc = xmloxide::html5::parse_html5(html).ok();
+
 
     // Try xpath-based content extraction first if xpath config is available.
     // Xpath extraction takes priority: if the URL matches a config rule
@@ -244,6 +250,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         }
     };
 
+
     // Try title-anchored extraction as an independent alternative strategy.
     // TA outputs its own markdown + text, not modified by downstream pipeline.
     // TA: self-contained markdown+text output, no downstream modification allowed.
@@ -253,7 +260,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         use crate::title_anchored::extract_from_doc;
 
         if let Some(ref xml_doc) = xml_doc {
-        if let Some(ta_result) = extract_from_doc(xml_doc) {
+        if let Some(ta_result) = crate::title_anchored::extract_from_doc_with_options(xml_doc, options.include_images) {
             let ta_text = ta_result.content_text;
             let ta_md = ta_result.content_markdown;
             let ta_len = ta_text.chars().count();
@@ -276,6 +283,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         }
         }
     }
+
 
     // If xpath or TA produced content, skip all downstream modifications (fallback, structured data, etc.)
     if !xpath_extracted && ta_markdown.is_none() {
@@ -320,6 +328,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
             content_html = Some(html.clone());
         }
     }
+
     } // end if !xpath_extracted && ta_markdown.is_none()
 
     // Step 7: Multi-candidate merge for service pages.
@@ -491,6 +500,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
     // (Disabled - testing showed marginal impact, may cause edge case regressions)
     // content_text = strip_navigation_boundaries(&content_text);
 
+
     // Extract comments if requested
     let (comments_text, comments_html) = if options.include_comments {
         extract_comments(&document, options)
@@ -521,6 +531,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         detected_page_type,
     );
 
+
     // Build initial result
     let mut result = ExtractResult {
         content_text,
@@ -536,6 +547,7 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         warnings,
         title_anchored_used: TA_USED.with(|c| c.get()),
     };
+
 
     // EPIC-02: Generate Markdown output if enabled
     // Uses quick_html2md for HTML→Markdown conversion with GFM support
@@ -604,16 +616,16 @@ pub(crate) fn extract_content(html_input: &str, options: &Options) -> Result<Ext
         result.content_text = ta_md.clone();
     }
 
+
     // Apply final validations and return
     // Reset thread-local flag
     COMMENTS_ARE_CONTENT.with(|c| c.set(false));
 
     let final_result = apply_final_validations(result, &document, options);
 
-    if cfg!(debug_assertions) {
-        if let Ok(ref res) = final_result {
-            eprintln!("DEBUG: Extraction complete! Final content: {} chars", res.content_text.len());
-        }
+    match &final_result {
+        Ok(res) => tracing::info!(target: "extract", "done url={url_log} ok content_len={} quality={:.2}", res.content_text.len(), res.extraction_quality),
+        Err(e) => tracing::warn!(target: "extract", "done url={url_log} error={e}"),
     }
 
     final_result
@@ -1716,10 +1728,9 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
         if cfg!(debug_assertions) {
             eprintln!("DEBUG: Using body extraction fallback");
         }
-        (
-            extract_body_content(doc, options)?,
-            extract_body_content_html(doc, options)?,
-        )
+        let t = extract_body_content(doc, options)?;
+        let h = extract_body_content_html(doc, options)?;
+        (t, h)
     };
 
     let mut extracted_from_content_node = content_node.is_some();
@@ -2687,15 +2698,11 @@ fn extract_filtered_text_inner(
     // Handle root-as-table: when the root element IS a table, process it directly
     // (descendants() excludes self, so the normal is_table check inside the loop won't fire)
     let root_tag = root_node.node_name();
-    eprintln!("!!! extract_filtered_text_inner: root_tag={:?} root_text_len={}", root_tag, root.text().len());
     if root_tag.as_ref().is_some_and(|t| t.eq_ignore_ascii_case("table")) {
         let table_sel = Selection::from(*root_node);
-        eprintln!("!!! ROOT IS TABLE: is_layout={} ld_test={} include_tables={}",
-            is_layout_table(&table_sel), link_density_test_tables(&table_sel, options), options.include_tables);
         if options.include_tables && !is_layout_table(&table_sel)
             && !link_density_test_tables(&table_sel, options)
         {
-            eprintln!("!!! CALLING extract_table_text");
             let table_text = extract_table_text(&table_sel);
             if !table_text.is_empty() {
                 out.push_str("\n\n");
@@ -2703,7 +2710,6 @@ fn extract_filtered_text_inner(
                 out.push_str("\n\n");
             }
         } else {
-            eprintln!("!!! TABLE FILTERED, falling to raw text extraction");
             for node in root_node.descendants() {
                 if node.is_text() {
                     let text = node.text();
@@ -2714,7 +2720,6 @@ fn extract_filtered_text_inner(
             }
         }
         let result = normalize_text_output(&out);
-        eprintln!("!!! extract_filtered_text_inner returning {} chars", result.len());
         return result;
     }
 

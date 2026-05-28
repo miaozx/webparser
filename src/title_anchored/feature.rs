@@ -76,8 +76,14 @@ impl FeatureTree {
         let mut text_node_count = 0usize;
         let mut stop = false;
         const MAX_TEXT_NODES: usize = 3000;
+        const MAX_VISITED_NODES: usize = 1000;
+        let mut visited_nodes = 0usize;
 
         for leaf in doc.descendants(body_node_id) {
+            visited_nodes += 1;
+            if visited_nodes > MAX_VISITED_NODES {
+                break;
+            }
             if !matches!(doc.node(leaf).kind, NodeKind::Text { .. }) {
                 continue;
             }
@@ -215,7 +221,13 @@ impl FeatureTree {
         }
 
         // Phase 2b: image counting (C++ BuildImageFeature)
+        const MAX_IMG_NODES: usize = 2000;
+        let mut img_visited = 0usize;
         for img_node in doc.descendants(body_node_id) {
+            img_visited += 1;
+            if img_visited > MAX_IMG_NODES {
+                break;
+            }
             if !doc.is_element(img_node) {
                 continue;
             }
@@ -589,7 +601,7 @@ fn matches_discard_class(s: &str) -> bool {
         "rmt-mobile-comment", "comment-respond", "b_comment_main",
         "pos_commentlist", "comments-content", "post-comments",
         "article-comments",
-        "dianzan", "share", "main-catalog", "art_share",
+        "dianzan", "main-catalog", "art_share",
         "articlesharebox", "headlist", "mainnav",
         "header-blue", "close", "head", "header",
         "main-nav", "comments", "nav",

@@ -75,25 +75,36 @@ pub fn extract_ml_features(doc: &Document, metadata: &Metadata, url: &str) -> [f
     f[13] = if domain.contains("shop.") || domain.contains("store.") { 1.0 } else { 0.0 };
 
     // === f[14..63]: HTML structural features ===
+    // Skip expensive HTML features on large pages (>500 body children)
+    let body_child_count = doc.select("body > *").length();
+    let is_large_page = body_child_count > 500;
 
-    // Paragraph stats
-    let mut p_count = 0u32;
-    let mut p_total_len = 0u32;
-    for node in doc.select("p").nodes() {
-        let sel = Selection::from(*node);
-        let text = sel.text();
-        let trimmed = text.trim();
-        if trimmed.len() > 20 {
-            p_count += 1;
-            p_total_len += trimmed.len() as u32;
+    let body_text_full;
+    let body_text_len;
+    if !is_large_page {
+        // Paragraph stats
+        let mut p_count = 0u32;
+        let mut p_total_len = 0u32;
+        for node in doc.select("p").nodes() {
+            let sel = Selection::from(*node);
+            let text = sel.text();
+            let trimmed = text.trim();
+            if trimmed.len() > 20 {
+                p_count += 1;
+                p_total_len += trimmed.len() as u32;
+            }
         }
+        f[14] = p_count as f64;
+        f[15] = if p_count > 0 { p_total_len as f64 / p_count as f64 } else { 0.0 };
+
+        body_text_full = doc.select("body").text().to_string();
+        body_text_len = body_text_full.len();
+    } else {
+        body_text_full = String::new();
+        body_text_len = 0;
     }
-    f[14] = p_count as f64;
-    f[15] = if p_count > 0 { p_total_len as f64 / p_count as f64 } else { 0.0 };
     f[16] = doc.select("h1, h2, h3, h4, h5, h6").length() as f64;
     let h2_count = doc.select("h2").length();
-    let body_text_full = doc.select("body").text().to_string();
-    let body_text_len = body_text_full.len();
     f[17] = if h2_count > 0 { body_text_len as f64 / h2_count as f64 } else { 0.0 };
     f[18] = if doc.select("article").length() > 0 { 1.0 } else { 0.0 };
     f[19] = if doc.select("time").length() > 0 { 1.0 } else { 0.0 };
@@ -128,21 +139,23 @@ pub fn extract_ml_features(doc: &Document, metadata: &Metadata, url: &str) -> [f
 
     let link_count = doc.select("a").length();
     let p_text = doc.select("p").text();
-    let p_words = p_text.split_whitespace().count();
+    let p_words = if !is_large_page { p_text.split_whitespace().count() } else { 0 };
     f[40] = if p_words > 0 { link_count as f64 / p_words as f64 } else { 0.0 };
     f[41] = p_words as f64;
     f[42] = doc.select("[class*='grid'], [class*='col-'], [class*='column'], [class*='card']").length() as f64;
     f[43] = doc.select("svg").length() as f64;
 
     let mut cta_count = 0u32;
-    for node in doc.select("button, a").nodes() {
-        let sel = Selection::from(*node);
-        let text = sel.text().to_ascii_lowercase();
-        if text.contains("get started") || text.contains("free trial") || text.contains("contact us")
-            || text.contains("sign up") || text.contains("try free") || text.contains("get pricing")
-            || text.contains("book a") || text.contains("schedule")
-        {
-            cta_count += 1;
+    if !is_large_page {
+        for node in doc.select("button, a").nodes() {
+            let sel = Selection::from(*node);
+            let text = sel.text().to_ascii_lowercase();
+            if text.contains("get started") || text.contains("free trial") || text.contains("contact us")
+                || text.contains("sign up") || text.contains("try free") || text.contains("get pricing")
+                || text.contains("book a") || text.contains("schedule")
+            {
+                cta_count += 1;
+            }
         }
     }
     f[44] = cta_count as f64;
@@ -162,10 +175,12 @@ pub fn extract_ml_features(doc: &Document, metadata: &Metadata, url: &str) -> [f
     f[58] = body_text_len as f64;
 
     let mut link_hrefs = HashSet::new();
-    for node in doc.select("a[href]").nodes() {
-        let sel = Selection::from(*node);
-        if let Some(href) = sel.attr("href") {
-            link_hrefs.insert(href.to_string());
+    if !is_large_page {
+        for node in doc.select("a[href]").nodes() {
+            let sel = Selection::from(*node);
+            if let Some(href) = sel.attr("href") {
+                link_hrefs.insert(href.to_string());
+            }
         }
     }
     f[59] = link_hrefs.len() as f64;
@@ -174,8 +189,8 @@ pub fn extract_ml_features(doc: &Document, metadata: &Metadata, url: &str) -> [f
     f[62] = doc.select("[class*='message']").length() as f64;
 
     // === f[63..73]: Enhanced structural features ===
-    // Skip expensive features on very large documents (>500KB text)
-    if body_text_len > 500_000 {
+    // Skip expensive features on very large documents (>500 HTML chars or 500 body children)
+    if is_large_page || body_text_len > 500_000 {
         return f;
     }
 

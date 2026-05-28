@@ -9,6 +9,12 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_env_filter("extract=info")
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: batch_markdown <input_dir> <output_dir>");

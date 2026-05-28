@@ -1,4 +1,8 @@
+use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use axum::{
@@ -143,9 +147,96 @@ async fn parse(Json(req): Json<ParseRequest>) -> (StatusCode, Json<ParseResponse
     }
 }
 
+fn cleanup_old_logs(dir: &PathBuf, days: u64) {
+    let cutoff = chrono::Duration::days(days as i64);
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(true, |e| e != "log") { continue; }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(age) = modified.elapsed() {
+                        if chrono::Duration::from_std(age).unwrap_or_default() > cutoff {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn log_path(log_dir: &PathBuf) -> PathBuf {
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    log_dir.join(format!("extract.{date}.log"))
+}
+
+struct LogWriter {
+    dir: PathBuf,
+    date: Mutex<String>,
+    file: Mutex<std::fs::File>,
+}
+
+impl LogWriter {
+    fn new(dir: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&dir);
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = log_path(&dir);
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).expect("open log");
+        Self { dir, date: Mutex::new(date), file: Mutex::new(file) }
+    }
+
+    fn rotate(&self) -> bool {
+        let now = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let mut date = self.date.lock().unwrap();
+        if *date == now { return false; }
+        *date = now;
+        let path = log_path(&self.dir);
+        *self.file.lock().unwrap() = std::fs::OpenOptions::new().create(true).append(true).open(&path).expect("open log");
+        cleanup_old_logs(&self.dir, 30);
+        true
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogFile;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.rotate();
+        let file = self.file.lock().unwrap().try_clone().expect("clone file");
+        LogFile(file)
+    }
+}
+
+struct LogFile(std::fs::File);
+
+impl Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+}
+
+fn init_log() {
+    let log_dir = std::env::var("WEBPARSER_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".local").join("share").join("webparser").join("logs")
+        });
+
+    let writer = LogWriter::new(log_dir);
+
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_file(false)
+        .with_line_number(false)
+        .with_writer(writer)
+        .with_env_filter("extract=info")
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    init_log();
 
     let app = Router::new()
         .route("/health", get(health))

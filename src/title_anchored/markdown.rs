@@ -26,10 +26,14 @@ pub fn extract_with_ta(html: &str) -> Option<TAExtractResult> {
             return None;
         }
     };
-    extract_from_doc(&doc)
+    extract_from_doc_with_options(&doc, false)
 }
 
 pub fn extract_from_doc(doc: &xmloxide::Document) -> Option<TAExtractResult> {
+    extract_from_doc_with_options(doc, false)
+}
+
+pub fn extract_from_doc_with_options(doc: &xmloxide::Document, include_images: bool) -> Option<TAExtractResult> {
     let features = FeatureTree::build(doc);
     let body_id = FeatureTree::find_body(doc).unwrap_or_else(|| doc.root());
 
@@ -50,7 +54,7 @@ pub fn extract_from_doc(doc: &xmloxide::Document) -> Option<TAExtractResult> {
         // C++ ParseContent
         match find_content_node_xml(doc, &features, tn, body_id) {
             Some(cn) if !features.is_filter_node(cn, doc) => {
-                let content_md = extract_content_markdown(doc, &features, cn, tn, body_id);
+                let content_md = extract_content_markdown(doc, &features, cn, tn, body_id, include_images);
                 let text_len = markdown_to_text(&content_md).len();
                 if text_len >= 256 {
                     (Some(cn), true, Some(tn))
@@ -72,7 +76,7 @@ pub fn extract_from_doc(doc: &xmloxide::Document) -> Option<TAExtractResult> {
             // C++ fallback
             match locate_content_node_with_feature_fallback(doc, &features, body_id) {
                 Some(cn) => {
-                    let content_md = extract_content_markdown(doc, &features, cn, cn, body_id);
+                    let content_md = extract_content_markdown(doc, &features, cn, cn, body_id, include_images);
                     let text_len = markdown_to_text(&content_md).len();
                     if text_len < 256 {
                         return None;
@@ -100,12 +104,12 @@ pub fn extract_from_doc(doc: &xmloxide::Document) -> Option<TAExtractResult> {
 
     let content_markdown = if anchored {
         if let Some(tn) = found_title {
-            extract_content_markdown(doc, &features, content_node, tn, body_id)
+            extract_content_markdown(doc, &features, content_node, tn, body_id, include_images)
         } else {
-            extract_content_markdown(doc, &features, content_node, content_node, body_id)
+            extract_content_markdown(doc, &features, content_node, content_node, body_id, include_images)
         }
     } else {
-        extract_content_markdown(doc, &features, content_node, content_node, body_id)
+        extract_content_markdown(doc, &features, content_node, content_node, body_id, include_images)
     };
 
     let content_text = markdown_to_text(&content_markdown);
@@ -254,11 +258,6 @@ fn find_content_node_xml(doc: &xmloxide::Document, features: &FeatureTree,
                 let hit_attr = super::feature::hit_content_attribute(child, doc);
                 let ratio = feat.exclude_a_text_len as f64 / denom;
 
-                eprintln!("DEBUG_CN: tag={} class={:?} match={} text_len={} exclude={} body_ex={} ratio={:.4} hit_attr={}",
-                    tag, doc.attribute(child, "class").unwrap_or(""),
-                    *match_node, feat.text_len, feat.exclude_a_text_len,
-                    body_feat.exclude_a_text_len, ratio, hit_attr);
-
                 // C++: text_len > 64 && HitContentAttribute && ratio > 0.35
                 if feat.text_len > 64 && hit_attr && ratio > 0.35 {
                     let inner = super::content::get_next_content_node(doc, child);
@@ -296,7 +295,7 @@ fn find_content_node_xml(doc: &xmloxide::Document, features: &FeatureTree,
 }
 
 fn extract_content_markdown(doc: &xmloxide::Document, features: &FeatureTree,
-    content_node: NodeId, title_node: NodeId, body_id: NodeId) -> String {
+    content_node: NodeId, title_node: NodeId, body_id: NodeId, include_images: bool) -> String {
     // C++ GetContent flow
 
     // Determine if title is inside content node
@@ -318,7 +317,7 @@ fn extract_content_markdown(doc: &xmloxide::Document, features: &FeatureTree,
     traverse_content(
         doc, features, content_node, title_node, title_in_cont,
         raw_time_node, time_in_cont, &mut match_node, &mut cur_text,
-        &mut para_list, &mut in_code_tag, &mut is_end
+        &mut para_list, &mut in_code_tag, &mut is_end, include_images,
     );
 
     // Flush remaining text
@@ -416,6 +415,7 @@ fn traverse_content(
     para_list: &mut Vec<String>,
     in_code_tag: &mut bool,
     is_end: &mut bool,
+    include_images: bool,
 ) {
     if *is_end { return; }
     let p_tag_name = doc.node_name(node).unwrap_or("").to_lowercase();
@@ -550,8 +550,8 @@ fn traverse_content(
                     }
                 }
 
-                // Handle img (C++: only in TraverseContent, video is in skip list)
-                if tag == "img" {
+                // Handle img
+                if tag == "img" && include_images {
                     handle_image(doc, child, para_list);
                 }
                 cur_text.clear();
@@ -618,7 +618,7 @@ fn traverse_content(
             // Recurse
             traverse_content(doc, features, child, title_node,
                 title_in_cont, raw_time_node, time_in_cont,
-                match_node, cur_text, para_list, in_code_tag, is_end);
+                match_node, cur_text, para_list, in_code_tag, is_end, include_images);
 
             // Close code block
             if tag == "pre" {
@@ -704,32 +704,36 @@ fn resolve_url(s: &str) -> String {
     }
 }
 
-fn get_table_text(doc: &xmloxide::Document, node: NodeId) -> String {
-    let mut rows: Vec<String> = Vec::new();
-    collect_table_rows(doc, node, &mut rows, 0);
-    if rows.is_empty() { return String::new(); }
-    rows.join("\n")
+fn serialize_xml_node(doc: &xmloxide::Document, id: NodeId, out: &mut String) {
+    if doc.is_element(id) {
+        if let Some(name) = doc.node_name(id) {
+            out.push('<');
+            out.push_str(name);
+            for attr in doc.attributes(id) {
+                let val = attr.value.replace('"', "&quot;");
+                out.push(' ');
+                out.push_str(&attr.name);
+                out.push_str("=\"");
+                out.push_str(&val);
+                out.push('"');
+            }
+            out.push('>');
+            for child in doc.children(id) {
+                serialize_xml_node(doc, child, out);
+            }
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+        }
+    } else if let Some(text) = doc.node_text(id) {
+        out.push_str(text);
+    }
 }
 
-fn collect_table_rows(doc: &xmloxide::Document, node: NodeId, rows: &mut Vec<String>, _depth: usize) {
-    let tag = doc.node_name(node).unwrap_or("").to_lowercase();
-    if tag == "tr" {
-        let mut cells: Vec<String> = Vec::new();
-        for child in doc.children(node) {
-            if doc.is_element(child) {
-                let ct = doc.node_name(child).unwrap_or("").to_lowercase();
-                if ct == "td" || ct == "th" {
-                    let mut cell_text = String::new();
-                    collect_inline_text(doc, child, &mut cell_text);
-                    cells.push(cell_text.trim().to_string());
-                }
-            }
-        }
-        rows.push(cells.join("\t"));
-    }
-    for child in doc.children(node) {
-        collect_table_rows(doc, child, rows, _depth + 1);
-    }
+fn get_table_text(doc: &xmloxide::Document, node: NodeId) -> String {
+    let mut out = String::new();
+    serialize_xml_node(doc, node, &mut out);
+    out
 }
 
 fn collect_inline_text(doc: &xmloxide::Document, node: NodeId, out: &mut String) {

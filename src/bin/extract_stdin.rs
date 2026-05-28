@@ -3,7 +3,6 @@
 
 use rs_trafilatura::{extract_with_options, Options};
 use rs_trafilatura::page_type::PageType;
-use rs_trafilatura::xpath_config::XpathConfig;
 use serde::Serialize;
 use std::io::{self, Read};
 
@@ -30,6 +29,12 @@ struct Output {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_env_filter("extract=info")
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Parse optional flags
@@ -38,6 +43,7 @@ fn main() {
     let mut hybrid = false;
     let mut markdown = false;
     let mut disable_title_anchored = false;
+    let mut include_images = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -77,6 +83,10 @@ fn main() {
                 disable_title_anchored = true;
                 i += 1;
             }
+            "--include-images" => {
+                include_images = true;
+                i += 1;
+            }
             _ => { i += 1; }
         }
     }
@@ -102,6 +112,7 @@ fn main() {
         output_markdown: markdown,
         disable_title_anchored,
         xpath_config,
+        include_images,
         include_tables: if markdown { true } else { Options::default().include_tables },
         include_links: if markdown { true } else { Options::default().include_links },
         include_formatting: if markdown { true } else { Options::default().include_formatting },
