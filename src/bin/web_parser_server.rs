@@ -234,9 +234,27 @@ fn init_log() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn worker_threads() -> usize {
+    std::env::var("WEBPARSER_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_log();
+
+    let n = worker_threads();
+    tracing::info!("starting with {} worker threads", n);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(n)
+        .enable_all()
+        .build()?;
+    rt.block_on(async { run_server().await })
+}
+
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health", get(health))
