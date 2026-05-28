@@ -209,7 +209,7 @@ mod markdown_validation_tests {
         use rs_trafilatura::{extract_with_options, Options};
 
         let html = r#"
-            <html><body>
+            <html><head><title>Different Page Title</title></head><body>
             <article>
                 <h1>Article Title</h1>
                 <p>This is a statement with emphasis.</p>
