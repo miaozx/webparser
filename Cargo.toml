@@ -14,6 +14,8 @@ keywords = ["html", "content-extraction", "web-scraping", "trafilatura", "boiler
 categories = ["parser-implementations", "web-programming", "text-processing"]
 
 [dependencies]
+aes = "0.8"
+base64 = "0.22"
 html-cleaning = "0.3"
 quick_html2md = { path = "lib/quick_html2md" }
 web-page-classifier = "0.1"
@@ -30,6 +32,7 @@ spider = { version = ">=2.37, <3", optional = true, default-features = false }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
+xmloxide = "0.4.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
@@ -74,4 +77,3 @@ doc_markdown = "allow"                   # Too strict about backticks
 float_cmp = "allow"                      # Approximate comparisons are intentional
 too_many_lines = "allow"                 # Some complex functions need to be long
 missing_errors_doc = "allow"             # Error types are self-explanatory
-missing_panics_doc = "allow"             # We don't panic in production code

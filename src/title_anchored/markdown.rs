@@ -1,12 +1,9 @@
 use xmloxide::NodeId;
 
-use super::feature::{FeatureTree, is_visible_node, hit_content_attribute};
+use super::feature::{FeatureTree, hit_content_attribute};
 use super::end_signals::is_end_text;
-use super::title_locator::{parse_head_title, locate_title_node};
+use super::title_locator::{parse_head_title, locate_title_node, parse_title_from_h1_fallback, parse_title_with_xpath};
 use super::time_locator::locate_time_near_title;
-
-/// Whether to include images in markdown output. Disabled by default.
-const INCLUDE_IMAGES: bool = false;
 
 const NEWLINE_TAGS: &[&str] = &[
     "p", "div", "section", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -30,72 +27,85 @@ pub fn extract_from_doc(doc: &xmloxide::Document) -> Option<TAExtractResult> {
     let features = FeatureTree::build(doc);
     let body_id = FeatureTree::find_body(doc).unwrap_or_else(|| doc.root());
 
-    // Head title
+    // C++ Parse: try ParseWithNodeLocation (title-anchored) first.
+    // head_title + title_node are NOT required (unlike current code that uses ?).
     let head_title = parse_head_title(doc);
-
-    // Title node: use full C++ logic; fallback to body
     let title_node = head_title.as_ref()
-        .and_then(|ht| locate_title_node(doc, ht, Some(&features)))
-        .or_else(|| Some(body_id));
-    let title = title_node
-        .map(|n| doc.text_content(n).trim().to_string())
-        .unwrap_or_default();
+        .and_then(|ht| locate_title_node(doc, ht, Some(&features)));
 
-    // Publish time (use full C++ logic: DFS 192 chars + time elements + date patterns + meta tags)
-    let publish_time_string = title_node
-        .and_then(|tn| locate_time_near_title(doc, tn, &title))
-        .map(|tn| doc.text_content(tn).trim().to_string());
+    // Try title-anchored content finding (C++ ParseWithNodeLocation → ParseContent)
+    let (content_node, anchored, found_title) = if let (Some(_ht), Some(tn)) = (&head_title, title_node) {
+        let title_text = doc.text_content(tn).trim().to_string();
+        // C++: ParsePublishTime (optional)
+        let _pub_time = locate_time_near_title(doc, tn, &title_text)
+            .map(|tn| doc.text_content(tn).trim().to_string())
+            .or_else(|| parse_publish_time_from_meta(doc, body_id));
 
-    // Content node: C++ ParseContent → LocateContentNode (title-anchored)
-    // If content is too short (< 256 chars, C++ threshold), fall back to
-    // C++ Parse → LocateContentNodeWithFeature (ratio-based fallback)
-    // If still not found, return empty content (no body fallback)
-    let fallback_node = title_node
-        .and_then(|tn| {
-            let cn = find_content_node_xml(doc, &features, tn, body_id)?;
-            let preview = extract_content_markdown(doc, &features, cn, tn, body_id);
-            let text = markdown_to_text(&preview);
-            if text.len() >= 256 { Some(cn) } else { None }
-        })
-        .and_then(|cn| {
-            // C++ ParseContent: reject if content node is a filter node
-            if features.is_filter_node(cn, doc) { None } else { Some(cn) }
-        })
-        .and_then(|cn| {
-            // C++ ParseContent: reject if content is image-link-heavy (sidebars etc.)
-            let preview = extract_content_markdown(doc, &features, cn, title_node.unwrap_or(body_id), body_id);
-            let total = preview.len();
-            if total == 0 { return None; }
-            let img_lines = preview.lines().filter(|l| l.trim().starts_with("![](")).count();
-            let total_lines = preview.lines().count();
-            if total_lines > 0 && (img_lines as f64 / total_lines as f64) > 0.5 {
-                None
-            } else {
-                Some(cn)
+        // C++ ParseContent
+        match find_content_node_xml(doc, &features, tn, body_id) {
+            Some(cn) if !features.is_filter_node(cn, doc) => {
+                let content_md = extract_content_markdown(doc, &features, cn, tn, body_id);
+                let text_len = markdown_to_text(&content_md).len();
+                if text_len >= 256 {
+                    (Some(cn), true, Some(tn))
+                } else {
+                    // content too short, fall through to fallback
+                    (None, false, Some(tn))
+                }
             }
-        })
-        .or_else(|| {
-            // C++ LocateContentNodeWithFeature fallback
-            locate_content_node_with_feature_fallback(doc, &features, body_id)
-        });
-    let Some(fallback_node) = fallback_node else {
-        return Some(TAExtractResult {
-            title,
-            publish_time: publish_time_string.unwrap_or_default(),
-            content_text: String::new(),
-            content_markdown: String::new(),
-        });
+            _ => (None, false, Some(tn))
+        }
+    } else {
+        (None, false, None)
     };
-    let cn_tag = doc.node_name(fallback_node).unwrap_or("?");
-    let cn_class = doc.attribute(fallback_node, "class").unwrap_or("");
-    eprintln!("TA_FINAL_CN: tag={} class={:?} text_len={}",
-        cn_tag, cn_class, doc.text_content(fallback_node).trim().len());
 
-    // Extract markdown from content node
-    let content_markdown = extract_content_markdown(doc, &features, fallback_node,
-        title_node.unwrap_or(body_id), body_id);
+    // C++ Parse fallback: LocateContentNodeWithFeature + GetContent + try ParseTitleFromH1/ParseTitleWithXpath
+    let (content_node, found_title) = match content_node {
+        Some(cn) => (cn, found_title),
+        None => {
+            // C++ fallback
+            match locate_content_node_with_feature_fallback(doc, &features, body_id) {
+                Some(cn) => {
+                    let content_md = extract_content_markdown(doc, &features, cn, cn, body_id);
+                    let text_len = markdown_to_text(&content_md).len();
+                    if text_len < 256 {
+                        return None;
+                    }
+                    // C++: try to find title in fallback mode
+                    let title_node = found_title.or_else(|| {
+                        // C++: ParseTitleFromH1("", title_node, &title, false)
+                        parse_title_from_h1_fallback(doc)
+                        // C++: ParseTitleWithXpath
+                        .or_else(|| parse_title_with_xpath(doc))
+                    });
+                    (cn, title_node)
+                }
+                None => return None,
+            }
+        }
+    };
+
+    let title = found_title.map(|tn| doc.text_content(tn).trim().to_string()).unwrap_or_default();
+    let publish_time_string = found_title.and_then(|tn| {
+        locate_time_near_title(doc, tn, &title)
+            .map(|t| doc.text_content(t).trim().to_string())
+            .or_else(|| parse_publish_time_from_meta(doc, body_id))
+    }).or_else(|| parse_publish_time_from_meta(doc, body_id));
+
+    let content_markdown = if anchored {
+        if let Some(tn) = found_title {
+            extract_content_markdown(doc, &features, content_node, tn, body_id)
+        } else {
+            extract_content_markdown(doc, &features, content_node, content_node, body_id)
+        }
+    } else {
+        extract_content_markdown(doc, &features, content_node, content_node, body_id)
+    };
 
     let content_text = markdown_to_text(&content_markdown);
+    if content_text.len() < 256 {
+        return None;
+    }
 
     Some(TAExtractResult {
         title,
@@ -105,50 +115,29 @@ pub fn extract_from_doc(doc: &xmloxide::Document) -> Option<TAExtractResult> {
     })
 }
 
-fn parse_head_title_xml(doc: &xmloxide::Document) -> Option<String> {
-    let root = doc.root_element().or_else(|| doc.children(doc.root()).next())?;
-    for node in doc.descendants(root) {
-        if doc.is_element(node) && doc.node_name(node).map_or(false, |n| n.eq_ignore_ascii_case("title")) {
-            let t = doc.text_content(node).trim().to_string();
-            if !t.is_empty() {
-                return Some(t);
+fn parse_publish_time_from_meta(doc: &xmloxide::Document, body_id: NodeId) -> Option<String> {
+    for node in doc.descendants(body_id) {
+        if doc.is_element(node) && doc.node_name(node).map_or(false, |n| n.eq_ignore_ascii_case("meta")) {
+            if let Some(prop) = doc.attribute(node, "property") {
+                if prop == "article:published_time" || prop == "article:modified_time" {
+                    if let Some(c) = doc.attribute(node, "content") {
+                        let t = c.trim().to_string();
+                        if !t.is_empty() { return Some(t); }
+                    }
+                }
+            }
+            if let Some(name) = doc.attribute(node, "name") {
+                let n = name.to_ascii_lowercase();
+                if n == "pubdate" || n == "publishdate" || n == "citation_publication_date" {
+                    if let Some(c) = doc.attribute(node, "content") {
+                        let t = c.trim().to_string();
+                        if !t.is_empty() { return Some(t); }
+                    }
+                }
             }
         }
     }
     None
-}
-
-fn locate_title_node_xml(doc: &xmloxide::Document, head_title: &str,
-    features: Option<&FeatureTree>) -> Option<NodeId> {
-    let body_id = FeatureTree::find_body(doc).unwrap_or_else(|| doc.root());
-
-    // Try h1/h2 matching head_title
-    for tag in &["h1", "h2"] {
-        for node in doc.descendants(body_id) {
-            if !doc.is_element(node) { continue; }
-            if doc.node_name(node).map_or(false, |n| n.eq_ignore_ascii_case(tag)) {
-                let t = doc.text_content(node).trim().to_string();
-                if !t.is_empty() && (head_title.contains(&t) || t.contains(head_title)) {
-                    return Some(node);
-                }
-            }
-        }
-    }
-    // fallback: first h1/h2 with text > 15
-    for tag in &["h1", "h2"] {
-        for node in doc.descendants(body_id) {
-            if !doc.is_element(node) { continue; }
-            if doc.node_name(node).map_or(false, |n| n.eq_ignore_ascii_case(tag)) {
-                let text = doc.text_content(node);
-                let t = text.trim();
-                if t.len() > 15 {
-                    return Some(node);
-                }
-            }
-        }
-    }
-    // last resort: use body itself as the "title node"
-    Some(body_id)
 }
 
 fn locate_content_node_with_feature_fallback(
@@ -190,12 +179,15 @@ fn locate_content_node_with_feature_fallback(
         }
     }
 
-    // Method 3: self-ratio > 0.8 && exclude > 800
+    // Method 3: self-ratio > 0.8 && exclude > 800 (C++: max 1000 nodes)
     if best.is_none() {
         let mut max_ex = 0usize;
+        let mut node_count = 0usize;
         for node in doc.descendants(body_id) {
             if !doc.is_element(node) { continue; }
             let Some(feat) = features.get(node) else { continue; };
+            node_count += 1;
+            if node_count > 1000 { break; }
             if feat.exclude_a_text_len < 800 { continue; }
             let sr = feat.exclude_a_text_len as f64 / (feat.text_len as f64).max(1.0);
             if sr > 0.8 && feat.exclude_a_text_len > max_ex
@@ -207,8 +199,6 @@ fn locate_content_node_with_feature_fallback(
         }
     }
 
-    // C++ also adds: if max_text_len > 126 from Method 1 as extra check
-    // and Method 3 has 1000 node cap — both minor, omitted for now
     best.map(|(id, _)| id)
 }
 
@@ -259,22 +249,30 @@ fn find_content_node_xml(doc: &xmloxide::Document, features: &FeatureTree,
             if !super::feature::is_visible_node(child, doc) { continue; }
             if features.is_filter_node(child, doc) { continue; }
 
+            // Debug: print features for every candidate
+            if let Some(feat) = features.get(child) {
+                eprintln!("DEBUG_CN: tag={} class={:?} match={} text_len={} exclude={} body_ex={} ratio={:.4} hit_attr={}",
+                    tag, doc.attribute(child, "class").unwrap_or(""),
+                    *match_node, feat.text_len, feat.exclude_a_text_len,
+                    body_feat.exclude_a_text_len,
+                    if body_feat.exclude_a_text_len > 0 { feat.exclude_a_text_len as f64 / body_feat.exclude_a_text_len as f64 } else { 0.0 },
+                    super::feature::hit_content_attribute(child, doc));
+            }
+
             // C++ IsContentNode check
             if let Some(feat) = features.get(child) {
-                // C++: text_len > 64 && HitContentAttribute && exclude/body_exclude > 0.35
+                let denom = (body_feat.exclude_a_text_len + 1) as f64;
+                // C++: text_len > 64 && HitContentAttribute && exclude/(body_exclude+1) > 0.35
                 if feat.text_len > 64
                     && super::feature::hit_content_attribute(child, doc)
-                    && body_feat.exclude_a_text_len > 0
-                    && (feat.exclude_a_text_len as f64 / body_feat.exclude_a_text_len as f64) > 0.35
+                    && (feat.exclude_a_text_len as f64 / denom) > 0.35
                 {
                     // C++: try GetNextContentNode unwrapping, then return
                     let inner = super::content::get_next_content_node(doc, child);
                     if let Some(inner_id) = inner {
-                        if let Some(inner_feat) = features.get(inner_id) {
-                            if features.is_content_node(inner_id, doc, body_feat.exclude_a_text_len, true) {
-                                if let Some(p) = doc.parent(inner_id) {
-                                    return Some(p);
-                                }
+                        if features.is_content_node(inner_id, doc, body_feat.exclude_a_text_len, true) {
+                            if let Some(p) = doc.parent(inner_id) {
+                                return Some(p);
                             }
                         }
                     }
@@ -293,10 +291,8 @@ fn find_content_node_xml(doc: &xmloxide::Document, features: &FeatureTree,
                 if feat.tag_a_nc >= 101 && feat.max_exclude_a_text_len < 20.0 {
                     continue;
                 }
-                // C++: match_node && exclude/body_exclude > 0.6
-                if *match_node && body_feat.exclude_a_text_len > 0
-                    && (feat.exclude_a_text_len as f64 / body_feat.exclude_a_text_len as f64) > 0.6
-                {
+                // C++: match_node && exclude/(body_exclude+1) > 0.6
+                if *match_node && (feat.exclude_a_text_len as f64 / denom) > 0.6 {
                     return Some(child);
                 }
             }
@@ -326,11 +322,9 @@ fn extract_content_markdown(doc: &xmloxide::Document, features: &FeatureTree,
     // so there's nothing to "match" — process everything from the start)
     let title_in_cont = content_node != title_node && is_contains_node(doc, content_node, title_node);
 
-    // Time node / time area
-    let time_node = find_time_in_content(doc, content_node, title_node, body_id);
-    let time_in_cont = time_node.map_or(false, |tn| is_contains_node(doc, content_node, tn));
-    let time_area = time_node.and_then(|tn| get_time_node_area(doc, tn));
-    //
+    // C++ GetContent: pass time_node directly (GetTimeNodeArea is computed but not used)
+    let raw_time_node = find_time_in_content(doc, content_node, title_node, body_id);
+    let time_in_cont = raw_time_node.map_or(false, |tn| is_contains_node(doc, content_node, tn));
 
     // Traverse content
     let mut match_node = !(title_in_cont || time_in_cont);
@@ -341,7 +335,7 @@ fn extract_content_markdown(doc: &xmloxide::Document, features: &FeatureTree,
 
     traverse_content(
         doc, features, content_node, title_node, title_in_cont,
-        time_area, time_in_cont, &mut match_node, &mut cur_text,
+        raw_time_node, time_in_cont, &mut match_node, &mut cur_text,
         &mut para_list, &mut in_code_tag, &mut is_end
     );
 
@@ -433,7 +427,7 @@ fn traverse_content(
     node: NodeId,
     title_node: NodeId,
     title_in_cont: bool,
-    time_area: Option<NodeId>,
+    raw_time_node: Option<NodeId>,
     time_in_cont: bool,
     match_node: &mut bool,
     cur_text: &mut String,
@@ -450,22 +444,28 @@ fn traverse_content(
         li_index += 1;
         let mut start = *match_node;
 
-        // Time/title sync — search recursively in the subtree
+        // C++ TraverseContent: time_in_cont checked with priority; title_in_cont only when !time_in_cont
         if time_in_cont || title_in_cont {
             if time_in_cont {
-                if let Some(tn) = time_area {
-                    if child == tn || is_contains_node(doc, child, tn) {
+                if let Some(tn) = raw_time_node {
+                    // C++: child == time_node (exact match, not contains)
+                    if child == tn {
                         *match_node = true;
                         start = true;
                         let tc = doc.text_content(tn).trim().len();
                         if tc < 150 { continue; }
                     }
                 }
+            // C++: else if title_in_cont (only reached when !time_in_cont)
             } else if title_in_cont {
-                if child == title_node || is_contains_node(doc, child, title_node) {
+                // C++: child == title_node (exact match)
+                if child == title_node {
                     *match_node = true;
                     start = true;
-                    let tc = doc.text_content(title_node).trim().len();
+                    // C++ intentionally uses time_node (not title_node) for length check
+                    let tc = raw_time_node
+                        .map(|tn| doc.text_content(tn).trim().len())
+                        .unwrap_or(0);
                     if tc < 120 { continue; }
                 }
             }
@@ -490,12 +490,9 @@ fn traverse_content(
                             continue;
                         }
                     }
-            // Check for end signals: exact match or common end patterns
-            let is_end_signal = (is_end_text(trimmed) || trimmed == "推荐阅读"
-                || trimmed.starts_with("相关文章") || trimmed.starts_with("推荐阅读"))
-                && (text_len_ > 256 || cur_text.len() > 256);
-            if is_end_signal {
-                *is_end = true;
+                    // C++: IsEndText(node_content) && text_len_ > 256 && node_content.length() < 64
+                    if is_end_text(trimmed) && text_len_ > 256 && trimmed.len() < 64 {
+                        *is_end = true;
                     } else {
                         cur_text.push_str(&node_content);
                     }
@@ -527,14 +524,10 @@ fn traverse_content(
                 }
             }
 
-            // End class check: C++ rel_art_line + related/recommend section markers
+            // C++ IsEndClassValue: only rel_art_line
             if let Some(class_val) = doc.attribute(child, "class") {
                 let lc = class_val.to_ascii_lowercase();
-                if lc.contains("rel_art_line") || lc.contains("relateread")
-                    || lc.contains("relate") && (lc.contains("read") || lc.contains("news"))
-                    || lc.contains("recommend")
-                    || lc.contains("xglinks") || lc.contains("suggest")
-                {
+                if lc.contains("rel_art_line") {
                     *is_end = true;
                     break;
                 }
@@ -559,8 +552,8 @@ fn traverse_content(
                     }
                 }
 
-                // Handle img (disabled by default, re-enable via INCLUDE_IMAGES constant)
-                if tag == "img" && INCLUDE_IMAGES {
+                // Handle img (C++: only in TraverseContent, video is in skip list)
+                if tag == "img" {
                     handle_image(doc, child, para_list);
                 }
                 cur_text.clear();
@@ -626,7 +619,7 @@ fn traverse_content(
 
             // Recurse
             traverse_content(doc, features, child, title_node,
-                title_in_cont, time_area, time_in_cont,
+                title_in_cont, raw_time_node, time_in_cont,
                 match_node, cur_text, para_list, in_code_tag, is_end);
 
             // Close code block
@@ -662,12 +655,47 @@ fn handle_image(doc: &xmloxide::Document, img_node: NodeId, para_list: &mut Vec<
         .or_else(|| doc.attribute(img_node, "src"));
     if let Some(s) = src {
         if s.contains("data:") { return; }
-        // Sohu AES decryption would go here if needed
         let absolute = resolve_url(&s);
-        if !absolute.is_empty() {
+        if !absolute.is_empty() && is_valid_image_node(doc, img_node) {
             para_list.push(format!("![]({})", absolute));
         }
     }
+}
+
+/// C++ IsValidImageNode: if img is wrapped in <a>, require href to end with image extension
+/// or title to contain "查看原图"/"查看图片". Otherwise reject.
+fn is_valid_image_node(doc: &xmloxide::Document, img_node: NodeId) -> bool {
+    let mut a_node = None;
+    let mut cur = doc.parent(img_node);
+    while let Some(p) = cur {
+        if doc.is_element(p) {
+            if doc.node_name(p).map_or(false, |n| n.eq_ignore_ascii_case("a")) {
+                a_node = Some(p);
+                break;
+            }
+        }
+        cur = doc.parent(p);
+    }
+    let Some(a) = a_node else { return true; };
+    let href = doc.attribute(a, "href");
+    match href {
+        Some(h) => {
+            let lower = h.to_ascii_lowercase();
+            if lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+                || lower.ends_with(".png") || lower.ends_with(".gif")
+                || lower.ends_with(".webp")
+            {
+                return true;
+            }
+        }
+        None => return false,
+    }
+    if let Some(title) = doc.attribute(a, "title") {
+        if title.contains("查看原图") || title.contains("查看图片") {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_url(s: &str) -> String {
@@ -732,11 +760,43 @@ fn has_text_child(doc: &xmloxide::Document, node: NodeId) -> bool {
     false
 }
 
-fn is_user_card(doc: &xmloxide::Document, node: NodeId) -> bool {
+fn traverse_user_card(doc: &xmloxide::Document, node: NodeId,
+    has_a: &mut bool, has_i: &mut bool, has_name: &mut bool,
+    has_img: &mut bool, has_zixun: &mut bool, text: &mut String) {
+    if let Some(tag) = doc.node_name(node) {
+        let tag = tag.to_lowercase();
+        if tag == "a" { *has_a = true; }
+        if tag == "i" { *has_i = true; }
+        if tag == "img" { *has_img = true; }
+    }
+    if matches!(doc.node(node).kind, xmloxide::tree::NodeKind::Text { .. }) {
+        if let Some(content) = doc.node_text(node) {
+            let trimmed = content.trim().to_string();
+            text.push_str(&trimmed);
+            if trimmed.contains("律师") || trimmed.contains("医师")
+                || trimmed.contains("咨询助手") || trimmed.contains("情感咨询")
+            {
+                *has_name = true;
+            } else if trimmed.contains("咨询") || trimmed.contains("提问") {
+                *has_zixun = true;
+            }
+        }
+    }
+    for child in doc.children(node) {
+        traverse_user_card(doc, child, has_a, has_i, has_name, has_img, has_zixun, text);
+    }
+}
+
+fn hit_user_attribute(doc: &xmloxide::Document, node: NodeId) -> bool {
     let tag = doc.node_name(node).unwrap_or("").to_lowercase();
+    let allowed = ["a", "address", "div", "link", "p", "span", "strong"];
+    if !allowed.contains(&tag.as_str()) {
+        return false;
+    }
     if let Some(class_val) = doc.attribute(node, "class") {
         let lc = class_val.to_ascii_lowercase();
-        if lc.contains("author-name") || lc.contains("authorcard")
+        if lc.contains("author-name") || lc.contains("authorname")
+            || lc.contains("author name") || lc.contains("authorcard")
             || lc.contains("zuozhe") || lc.contains("bianji")
             || lc.contains("xiaobian") || lc.contains("posted-by")
             || lc.contains("submitted-by")
@@ -747,6 +807,26 @@ fn is_user_card(doc: &xmloxide::Document, node: NodeId) -> bool {
     if let Some(id_val) = doc.attribute(node, "id") {
         let lc = id_val.to_ascii_lowercase();
         if lc == "author" || lc == "writer" || lc == "username" { return true; }
+    }
+    false
+}
+
+fn is_user_card(doc: &xmloxide::Document, node: NodeId) -> bool {
+    // C++ TraverseUserCard: subtree scan for has_a, has_i, has_name, has_img, has_zixun
+    let mut has_a = false;
+    let mut has_i = false;
+    let mut has_name = false;
+    let mut has_img = false;
+    let mut has_zixun = false;
+    let mut text = String::new();
+    traverse_user_card(doc, node, &mut has_a, &mut has_i,
+        &mut has_name, &mut has_img, &mut has_zixun, &mut text);
+
+    if text.len() < 200 && has_a && has_name && has_img && has_zixun {
+        return true;
+    }
+    if hit_user_attribute(doc, node) {
+        return true;
     }
     false
 }

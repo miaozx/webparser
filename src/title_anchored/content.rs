@@ -4,29 +4,73 @@ use super::end_signals::has_end_signal;
 
 const MIN_CONTENT_LEN: usize = 300;
 
-#[allow(dead_code)]
-fn is_user_card(id: NodeId, doc: &xmloxide::Document) -> bool {
-    let tag = doc.node_name(id).unwrap_or("").to_lowercase();
-    let allowed_tags = ["a", "address", "div", "link", "p", "span", "strong"];
-    if !allowed_tags.contains(&tag.as_str()) {
+fn traverse_user_card(doc: &xmloxide::Document, node: NodeId,
+    has_a: &mut bool, has_i: &mut bool, has_name: &mut bool,
+    has_img: &mut bool, has_zixun: &mut bool, text: &mut String) {
+    if let Some(tag) = doc.node_name(node) {
+        let tag = tag.to_lowercase();
+        if tag == "a" { *has_a = true; }
+        if tag == "i" { *has_i = true; }
+        if tag == "img" { *has_img = true; }
+    }
+    if matches!(doc.node(node).kind, xmloxide::tree::NodeKind::Text { .. }) {
+        if let Some(content) = doc.node_text(node) {
+            let trimmed = content.trim().to_string();
+            text.push_str(&trimmed);
+            if trimmed.contains("律师") || trimmed.contains("医师")
+                || trimmed.contains("咨询助手") || trimmed.contains("情感咨询")
+            {
+                *has_name = true;
+            } else if trimmed.contains("咨询") || trimmed.contains("提问") {
+                *has_zixun = true;
+            }
+        }
+    }
+    for child in doc.children(node) {
+        traverse_user_card(doc, child, has_a, has_i, has_name, has_img, has_zixun, text);
+    }
+}
+
+fn hit_user_attribute(doc: &xmloxide::Document, node: NodeId) -> bool {
+    let tag = doc.node_name(node).unwrap_or("").to_lowercase();
+    let allowed = ["a", "address", "div", "link", "p", "span", "strong"];
+    if !allowed.contains(&tag.as_str()) {
         return false;
     }
-    if let Some(class_val) = doc.attribute(id, "class") {
-        let lower = class_val.to_ascii_lowercase();
-        if lower.contains("author-name") || lower.contains("authorname")
-            || lower.contains("author name") || lower.contains("authorcard")
-            || lower.contains("zuozhe") || lower.contains("bianji")
-            || lower.contains("xiaobian") || lower.contains("posted-by")
-            || lower.contains("submitted-by")
+    if let Some(class_val) = doc.attribute(node, "class") {
+        let lc = class_val.to_ascii_lowercase();
+        if lc.contains("author-name") || lc.contains("authorname")
+            || lc.contains("author name") || lc.contains("authorcard")
+            || lc.contains("zuozhe") || lc.contains("bianji")
+            || lc.contains("xiaobian") || lc.contains("posted-by")
+            || lc.contains("submitted-by")
         {
             return true;
         }
     }
-    if let Some(id_val) = doc.attribute(id, "id") {
-        let lower = id_val.to_ascii_lowercase();
-        if lower == "author" || lower == "writer" || lower == "username" {
-            return true;
-        }
+    if let Some(id_val) = doc.attribute(node, "id") {
+        let lc = id_val.to_ascii_lowercase();
+        if lc == "author" || lc == "writer" || lc == "username" { return true; }
+    }
+    false
+}
+
+#[allow(dead_code)]
+fn is_user_card(id: NodeId, doc: &xmloxide::Document) -> bool {
+    let mut has_a = false;
+    let mut has_i = false;
+    let mut has_name = false;
+    let mut has_img = false;
+    let mut has_zixun = false;
+    let mut text = String::new();
+    traverse_user_card(doc, id, &mut has_a, &mut has_i,
+        &mut has_name, &mut has_img, &mut has_zixun, &mut text);
+
+    if text.len() < 200 && has_a && has_name && has_img && has_zixun {
+        return true;
+    }
+    if hit_user_attribute(doc, id) {
+        return true;
     }
     false
 }
@@ -86,34 +130,34 @@ fn is_content_node(
     let Some(feat) = features.get(id) else {
         return false;
     };
-    if feat.exclude_a_text_len < 64 {
-        return false;
-    }
     let tag = doc.node_name(id).unwrap_or("").to_lowercase();
-    // C++ IsListNode check
-    if features.is_list_node(id, doc) {
-        return false;
-    }
-    let ratio = feat.exclude_a_text_len as f64 / (body_exclude_len as f64).max(1.0);
-    // C++ IsContentNode: ratio > 0.35 + HitContentAttribute
-    if ratio > 0.35 && hit_content_attribute(id, doc) {
+    // C++: exclude_a_text_len * 1.0 / (body_exclude_a_text_len + 1)
+    let denom = (body_exclude_len + 1) as f64;
+    let ratio = feat.exclude_a_text_len as f64 / denom;
+    // C++ IsContentNode: text_len > 64 && HitContentAttribute && ratio > 0.35
+    if feat.text_len > 64
+        && hit_content_attribute(id, doc)
+        && (feat.exclude_a_text_len as f64 / denom) > 0.35
+    {
         return true;
     }
-    // C++: (ul/ol) && tag_a_nc > 100
-    if (tag == "ul" || tag == "ol") && feat.tag_a_nc > 100 {
-        return false;
-    }
-    // C++ negative checks
+    // C++ negative: has_recomment_title && tag_a_nc > 3 && click_image_count > 3
     if feat.has_recomment_title && feat.tag_a_nc > 3 && feat.click_image_count > 3 {
         return false;
     }
+    // C++ negative: match_node && tag_a_nc > 30 && click_image_count > 3
     if _match_node && feat.tag_a_nc > 30 && feat.click_image_count > 3 {
         return false;
     }
+    // C++ negative: (ul/ol) && tag_a_nc > 100
+    if (tag == "ul" || tag == "ol") && feat.tag_a_nc > 100 {
+        return false;
+    }
+    // C++ negative: tag_a_nc >= 101 && max_exclude_a_text_len < 20
     if feat.tag_a_nc >= 101 && feat.max_exclude_a_text_len < 20.0 {
         return false;
     }
-    // C++ IsContentNode: match_node && ratio > 0.6
+    // C++ positive: match_node && ratio > 0.6
     if _match_node && ratio > 0.6 {
         return true;
     }
