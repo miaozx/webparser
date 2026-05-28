@@ -101,22 +101,6 @@
       "xpath": ["//*[@class='post_content']"]
     }
   },
-  "cneb.gov.cn": {
-    "head_title": {
-      "xpath": "//*/title",
-      "single_node": true
-    },
-    "title": {
-      "xpath": ["//h1"],
-      "single_node": true
-    },
-    "content": {
-      "xpath": [
-        "//*[contains(@class, 'w940')]",
-        "//*[contains(@class, 'content')]"
-      ]
-    }
-  },
   "smzdm.com/(ju|p|talk)": {
     "head_title": {
       "xpath": "//*/title",
@@ -136,6 +120,41 @@
       "filter_xpath": [
         "//*[@class='note_card']"
       ]
+    }
+  },
+  "cznd.gov.cn/new": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": [
+        "//*[contains(@style, 'font-size:24px')]",
+        "//h1"
+      ],
+      "single_node": true
+    },
+    "publish_time": {
+      "xpath": "//td[contains(text(), '发布日期')]"
+    },
+    "content": {
+      "xpath": ["//td[@class='GovInfoContent']"]
+    }
+  },
+  "china.chinadaily.com.cn/a": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": ["//*[contains(@class, 'Artical_Title')]//h1"],
+      "single_node": true
+    },
+    "publish_time": {
+      "xpath": "//*[contains(@class, 'Artical_Share_Date')]"
+    },
+    "content": {
+      "xpath": ["//*[@id='Content']"]
     }
   }
 }
