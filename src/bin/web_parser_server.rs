@@ -25,7 +25,6 @@ struct ParseRequest {
     crawl_timestamp: Option<i64>,
     query: Option<String>,
     source: Option<String>,
-    img_in_content: Option<bool>,
     output_format: Option<String>,
 }
 
@@ -37,9 +36,6 @@ struct ParseResponse {
     title: String,
     head_title: String,
     publish_time: String,
-    image_list: Vec<String>,
-    video_list: Vec<String>,
-    position_list: Vec<i32>,
     time_cost: i64,
     should_cache: bool,
     hostname: String,
@@ -54,9 +50,6 @@ fn error_response(ret_code: i32, url: String, time_cost: i64) -> ParseResponse {
         title: String::new(),
         head_title: String::new(),
         publish_time: String::new(),
-        image_list: Vec::new(),
-        video_list: Vec::new(),
-        position_list: Vec::new(),
         time_cost,
         should_cache: false,
         hostname: String::new(),
@@ -83,11 +76,9 @@ async fn parse(Json(req): Json<ParseRequest>) -> (StatusCode, Json<ParseResponse
     };
 
     let output_markdown = matches!(req.output_format.as_deref(), Some("markdown") | Some("0"));
-    let include_images = req.img_in_content.unwrap_or(false);
 
     let options = Options {
         url: req.url.clone(),
-        include_images,
         output_markdown,
         ..Options::default()
     };
@@ -122,9 +113,6 @@ async fn parse(Json(req): Json<ParseRequest>) -> (StatusCode, Json<ParseResponse
                     title: title.clone(),
                     head_title: title,
                     publish_time,
-                    image_list: result.images.iter().map(|img| img.src.clone()).collect(),
-                    video_list: Vec::new(),
-                    position_list: Vec::new(),
                     time_cost: elapsed,
                     should_cache: result.extraction_quality > 0.8,
                     hostname: result.metadata.hostname.unwrap_or_default(),

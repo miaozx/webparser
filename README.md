@@ -431,3 +431,4 @@ If you use rs-trafilatura in academic work, please cite:
 - [trafilatura](https://github.com/adbar/trafilatura) - Original Python implementation by Adrien Barbaresi
 - [go-trafilatura](https://github.com/markusmobius/go-trafilatura) - Go port by Markus Mobius
 - [dom_query](https://github.com/niklak/dom_query) - DOM manipulation library
+- [xmloxide](https://github.com/jonwiggins/xmloxide) - Safe Rust wrappers for libxml2
