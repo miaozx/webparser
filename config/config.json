@@ -1,0 +1,142 @@
+{
+  "m.meishichina.com/recipe": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": "//*[@class=\"title\"]",
+      "single_node": true
+    },
+    "content": {
+      "xpath": [
+        "//*[@class=\"steplist\"]",
+        "//*[]@id='ingredientlist'"
+      ]
+    }
+  },
+  "jianshu.com/p": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": "//*[@class=\"title\"]",
+      "single_node": true
+    },
+    "publish_time": {
+      "xpath": "//*/time"
+    },
+    "content": {
+      "xpath": [
+        "//*/article",
+        "//*[@class=\"note-content\"]"
+      ]
+    }
+  },
+  "m.baidu.com/bh/m/detail": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": [
+        "//h1",
+        "//*[@class='title']"
+      ],
+      "single_node": true
+    },
+    "content": {
+      "xpath": [
+        "//*[contains(@class, 'index_textContent')]//p[1]",
+        "//*[contains(@class, 'index_textContent')]"
+      ]
+    }
+  },
+  "club.xywy.com/wenda": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": "//*[@class='ask-title'] | //h1",
+      "single_node": true
+    },
+    "content": {
+      "xpath": [
+        "//*[contains(@class, 'replay-content-box')]",
+        "//*[contains(@class, 'ask-details-box')]"
+      ]
+    }
+  },
+  "baike.sogou.com/v": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": [
+        "//h1",
+        "//*[@class='title']"
+      ],
+      "single_node": true
+    },
+    "content": {
+      "xpath": [
+        "//*[contains(@class, 'styles_contentPc')]",
+        "//*[contains(@class, 'contentPc')]"
+      ]
+    }
+  },
+  "163.com/dy/article": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": ["//h1"],
+      "single_node": true
+    },
+    "content": {
+      "xpath": ["//*[@class='post_content']"]
+    }
+  },
+  "cneb.gov.cn": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": ["//h1"],
+      "single_node": true
+    },
+    "content": {
+      "xpath": [
+        "//*[contains(@class, 'w940')]",
+        "//*[contains(@class, 'content')]"
+      ]
+    }
+  },
+  "smzdm.com/(ju|p|talk)": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": [
+        "//*/h1"
+      ],
+      "single_node": true
+    },
+    "publish_time": {
+      "xpath": "//*[@class='xilie']"
+    },
+    "content": {
+      "xpath": "//*/article",
+      "filter_xpath": [
+        "//*[@class='note_card']"
+      ]
+    }
+  }
+}
+
