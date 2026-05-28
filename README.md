@@ -15,6 +15,8 @@ A high-performance Rust port of [trafilatura](https://github.com/adbar/trafilatu
 - **Rich Metadata**: Title, author, date, description, categories, tags, license, images from JSON-LD, Open Graph, Dublin Core, and HTML meta tags
 - **Configurable**: 28 options to tune precision/recall tradeoff, content selection, and output format
 - **Robust**: Handles malformed HTML gracefully with automatic character encoding detection (UTF-8, ISO-8859-1, Windows-1252)
+- **Title Anchored**: Content extraction anchored around the title element, locating main content relative to the title position for improved accuracy
+- **XPath Parsing**: Select and extract content using XPath expressions for precise element targeting and custom extraction rules
 
 ## Quick Start
 
