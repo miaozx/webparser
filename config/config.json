@@ -94,11 +94,15 @@
       "single_node": true
     },
     "title": {
-      "xpath": ["//h1"],
+      "xpath": [
+        "//h1"
+      ],
       "single_node": true
     },
     "content": {
-      "xpath": ["//*[@class='post_content']"]
+      "xpath": [
+        "//*[@class='post_content']"
+      ]
     }
   },
   "smzdm.com/(ju|p|talk)": {
@@ -138,7 +142,9 @@
       "xpath": "//td[contains(text(), '发布日期')]"
     },
     "content": {
-      "xpath": ["//td[@class='GovInfoContent']"]
+      "xpath": [
+        "//td[@class='GovInfoContent']"
+      ]
     }
   },
   "china.chinadaily.com.cn/a": {
@@ -147,14 +153,33 @@
       "single_node": true
     },
     "title": {
-      "xpath": ["//*[contains(@class, 'Artical_Title')]//h1"],
+      "xpath": [
+        "//*[contains(@class, 'Artical_Title')]//h1"
+      ],
       "single_node": true
     },
     "publish_time": {
       "xpath": "//*[contains(@class, 'Artical_Share_Date')]"
     },
     "content": {
-      "xpath": ["//*[@id='Content']"]
+      "xpath": [
+        "//*[@id='Content']"
+      ]
+    }
+  },
+  "baike.baidu.com/item": {
+    "head_title": {
+      "xpath": "//*/title",
+      "single_node": true
+    },
+    "title": {
+      "xpath": [
+        "//*/h1"
+      ],
+      "single_node": true
+    },
+    "content": {
+      "xpath": "//*[contains(@class, 'mainContent')]"
     }
   }
 }

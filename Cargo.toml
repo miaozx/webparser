@@ -2,7 +2,7 @@
 name = "rs-trafilatura"
 version = "0.2.2"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Murrough Foley"]
 description = "Rust port of trafilatura - web content extraction library"
 license = "MIT OR Apache-2.0"
@@ -33,6 +33,7 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
 xmloxide = "0.4.3"
+pdf_oxide = "0.3.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
